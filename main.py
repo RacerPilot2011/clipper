@@ -569,97 +569,22 @@ class MainWindow(QMainWindow):
             self.recorder.start_recording()
             self.update_status("Recording buffer active (auto-started)")
     
-    def upload_clip(self):
-        """Upload selected clip to a free hosting service"""
-        current_item = self.clips_list.currentItem()
-        if not current_item:
-            QMessageBox.information(self, "No Clip Selected", 
-                                "Please select a clip to upload.")
-            return
-        
-        # Get actual filename from item data
-        filename = current_item.data(Qt.ItemDataRole.UserRole)
-        clip_path = self.recorder.clips_dir / filename
-        
-        if not clip_path.exists():
-            self.show_error("Clip file does not exist.")
-            return
-        
+    def upload_clip_to_render(clip_path, render_url):
+        import requests
         try:
-            self.update_status("Uploading clip...")
-            
-            # Read the file
             with open(clip_path, 'rb') as f:
-                files = {'file': (filename, f, 'video/mp4')}
-                
-                # Try multiple free hosting services
-                upload_success = False
-                download_url = ""
-                
-                # Try File.io first (14 days retention)
-                try:
-                    response = requests.post(
-                        'https://file.io',
-                        files=files,
-                        data={'expires': '14d'}  # 14 days retention
-                    )
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        if result.get('success'):
-                            download_url = result['link']
-                            upload_success = True
-                            self.update_status("Uploaded to File.io (14 days)")
-                except:
-                    pass
-                
-                # If File.io fails, try 0x0.st (free, no guaranteed retention but usually long)
-                if not upload_success:
-                    try:
-                        f.seek(0)  # Reset file pointer
-                        response = requests.post(
-                            'https://0x0.st',
-                            files={'file': f}
-                        )
-                        
-                        if response.status_code == 200:
-                            download_url = response.text.strip()
-                            upload_success = True
-                            self.update_status("Uploaded to 0x0.st")
-                    except:
-                        pass
-                
-                # If both fail, try tmpfiles.org (30 days retention)
-                if not upload_success:
-                    try:
-                        f.seek(0)  # Reset file pointer
-                        response = requests.post(
-                            'https://tmpfiles.org/api/v1/upload',
-                            files={'file': f}
-                        )
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            if result.get('status') == 'success':
-                                # Convert to direct download link
-                                file_url = result['data']['url']
-                                download_url = file_url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
-                                upload_success = True
-                                self.update_status("Uploaded to tmpfiles.org (30 days)")
-                    except:
-                        pass
-            
-            if upload_success and download_url:
-                # Copy to clipboard
-                QApplication.clipboard().setText(download_url)
-                
-                # Show success dialog with copy options
-                self.show_upload_success(download_url, filename)
-            else:
-                self.show_error("All upload services failed. Please try again later.")
-                
+                files = {'file': (clip_path.name, f, 'video/mp4')}
+                response = requests.post(f"{render_url}/upload", files=files)
+                data = response.json()
+                if data.get("success"):
+                    print("Uploaded:", data["url"])
+                    return data["url"]
+                else:
+                    print("Upload failed:", data)
+                    return None
         except Exception as e:
-            self.show_error(f"Upload error: {str(e)}")
+            print("Error uploading:", e)
+            return None
 
     def show_upload_success(self, url, filename):
         """Show upload success dialog with options"""
