@@ -20,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
 
       - name: Install dependencies
         run: |
@@ -33,22 +33,22 @@ jobs:
         run: |
           pyinstaller \
             --windowed \
-            --name MyApp \
+            --name Clipper \
             main.py
 
       - name: Build app (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --name MyApp main.py
+          pyinstaller --onefile --name Clipper main.py
 
       - name: Build app (Linux)
         if: runner.os == 'Linux'
         run: |
-          pyinstaller --onefile --name MyApp main.py
+          pyinstaller --onefile --name Clipper main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyApp-${{ runner.os }}
+          name: Clipper-${{ runner.os }}
           path: |
             dist/**
