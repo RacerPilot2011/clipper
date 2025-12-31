@@ -1,5 +1,12 @@
-PyQt6>=6.4.0
-opencv-python>=4.7.0
-mss>=9.0.1
-keyboard>=0.13.5
-numpy>=1.24.0
+certifi==2025.11.12
+charset-normalizer==3.4.4
+idna==3.11
+keyboard==0.13.5
+mss==10.1.0
+numpy==2.2.6
+opencv-python==4.12.0.88
+PyQt6==6.10.1
+PyQt6-Qt6==6.10.1
+PyQt6_sip==13.10.3
+requests==2.32.5
+urllib3==2.6.2
