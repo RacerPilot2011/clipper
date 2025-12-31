@@ -18,6 +18,7 @@ import requests
 import json
 from urllib.parse import urlparse
 import platform
+import os
 
 class RecorderSignals(QObject):
     """Signals for thread-safe communication"""
@@ -39,17 +40,21 @@ class ScreenRecorder:
         self.clips_dir = Path.home() / "ScreenClips"
         self.clips_dir.mkdir(exist_ok=True)
         self.permission_granted = False
+        self.sct = None
         
     def check_screen_recording_permission(self):
-        """Check if screen recording permission is granted on macOS"""
+        """Check if screen recording permission is granted"""
         if platform.system() != "Darwin":  # Not macOS
+            # For Linux, check if DISPLAY is set
+            if platform.system() == "Linux":
+                if not os.environ.get('DISPLAY'):
+                    return False
             return True
         
         try:
             # Try to capture a small screenshot to test permissions
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
-                # Try to grab just a 1x1 pixel to minimize overhead
                 test_region = {
                     "top": monitor["top"],
                     "left": monitor["left"],
@@ -58,11 +63,9 @@ class ScreenRecorder:
                 }
                 screenshot = sct.grab(test_region)
                 
-                # If we got here without exception, permission is granted
                 self.permission_granted = True
                 return True
         except Exception as e:
-            # Permission not granted or other error
             self.permission_granted = False
             return False
     
@@ -87,50 +90,108 @@ class ScreenRecorder:
         self.is_recording = False
         if self.record_thread:
             self.record_thread.join(timeout=2)
+        
+        # Close mss instance
+        if self.sct:
+            try:
+                self.sct.close()
+            except:
+                pass
+            self.sct = None
+        
         self.signals.status_update.emit("Recording stopped")
     
     def _record_loop(self):
         """Continuously capture screen to buffer"""
         try:
-            with mss.mss() as sct:
-                monitor = sct.monitors[1]  # Primary monitor
+            # Create persistent mss instance for this thread
+            self.sct = mss.mss()
+            
+            # Get monitor info
+            monitor = self.sct.monitors[1]  # Primary monitor
+            
+            # For Linux, ensure we're capturing the full screen correctly
+            if platform.system() == "Linux":
+                # Sometimes mss needs explicit monitor bounds
+                monitor = {
+                    "top": 0,
+                    "left": 0,
+                    "width": monitor["width"],
+                    "height": monitor["height"],
+                    "mon": 1
+                }
+            
+            frame_delay = 1.0 / self.fps
+            
+            while self.is_recording:
+                start_time = time.time()
                 
-                frame_delay = 1.0 / self.fps
-                
-                while self.is_recording:
-                    start_time = time.time()
+                try:
+                    # Capture screen with error handling
+                    screenshot = self.sct.grab(monitor)
                     
-                    try:
-                        # Capture screen
-                        screenshot = sct.grab(monitor)
-                        frame = np.array(screenshot)
-                        
-                        # Convert BGRA to BGR
+                    # Convert to numpy array
+                    frame = np.array(screenshot)
+                    
+                    # Convert BGRA to BGR
+                    if frame.shape[2] == 4:
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                        
-                        # Add timestamp
-                        timestamp = datetime.now()
-                        self.frame_buffer.append((frame, timestamp))
-                        
-                    except Exception as e:
-                        if platform.system() == "Darwin":
-                            # Permission was revoked
-                            self.signals.error_occurred.emit("Screen recording permission lost")
-                            self.is_recording = False
-                            self.permission_granted = False
-                            self.signals.permission_needed.emit()
-                            break
-                        else:
-                            raise
+                    elif frame.shape[2] == 3:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     
-                    # Maintain target FPS
-                    elapsed = time.time() - start_time
-                    sleep_time = max(0, frame_delay - elapsed)
-                    time.sleep(sleep_time)
+                    # Add timestamp
+                    timestamp = datetime.now()
+                    self.frame_buffer.append((frame, timestamp))
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    if "XGetImage" in error_msg or "X11" in error_msg:
+                        self.signals.error_occurred.emit(
+                            "X11 capture error. Try:\n"
+                            "1. Run: xhost +local:\n"
+                            "2. Or set DISPLAY variable\n"
+                            "3. Check if running in Wayland (may need XWayland)"
+                        )
+                        self.is_recording = False
+                        break
+                    elif platform.system() == "Darwin":
+                        # Permission was revoked
+                        self.signals.error_occurred.emit("Screen recording permission lost")
+                        self.is_recording = False
+                        self.permission_granted = False
+                        self.signals.permission_needed.emit()
+                        break
+                    else:
+                        # Other error, but try to continue
+                        print(f"Frame capture error: {e}")
+                        time.sleep(0.5)
+                        continue
+                
+                # Maintain target FPS
+                elapsed = time.time() - start_time
+                sleep_time = max(0, frame_delay - elapsed)
+                time.sleep(sleep_time)
+            
+            # Clean up mss instance
+            if self.sct:
+                try:
+                    self.sct.close()
+                except:
+                    pass
+                self.sct = None
                     
         except Exception as e:
             self.signals.error_occurred.emit(f"Recording error: {str(e)}")
             self.is_recording = False
+            
+            # Clean up on error
+            if self.sct:
+                try:
+                    self.sct.close()
+                except:
+                    pass
+                self.sct = None
     
     def save_clip(self, duration_seconds=None):
         """Save the last N seconds from buffer"""
@@ -655,7 +716,6 @@ class MainWindow(QMainWindow):
             success = self.recorder.start_recording()
             if success:
                 self.update_status("Recording buffer active (auto-started)")
-            # If it fails, the permission dialog will be shown automatically
     
     def upload_clip(self):
         """Upload selected clip to a free hosting service"""
@@ -665,7 +725,6 @@ class MainWindow(QMainWindow):
                                 "Please select a clip to upload.")
             return
         
-        # Get actual filename from item data
         filename = current_item.data(Qt.ItemDataRole.UserRole)
         clip_path = self.recorder.clips_dir / filename
         
@@ -676,15 +735,13 @@ class MainWindow(QMainWindow):
         try:
             self.update_status("Uploading clip...")
             
-            # Read the file
             with open(clip_path, 'rb') as f:
                 files = {'file': (filename, f, 'video/mp4')}
                 
-                # Try multiple free hosting services
                 upload_success = False
                 download_url = ""
                 
-                # Try File.io first (14 days retention)
+                # Try File.io first
                 try:
                     response = requests.post(
                         'https://file.io',
@@ -751,7 +808,6 @@ class MainWindow(QMainWindow):
         msg.setWindowTitle("Upload Successful")
         msg.setIcon(QMessageBox.Icon.Information)
         
-        # Create a more informative message
         message = f"""
         <b>Clip uploaded successfully!</b>
         
@@ -769,7 +825,6 @@ class MainWindow(QMainWindow):
         msg.setText(message)
         msg.setTextFormat(Qt.TextFormat.RichText)
         
-        # Add buttons
         msg.addButton("Open in Browser", QMessageBox.ButtonRole.AcceptRole)
         msg.addButton("Copy URL Again", QMessageBox.ButtonRole.ActionRole)
         msg.addButton("OK", QMessageBox.ButtonRole.RejectRole)
@@ -839,12 +894,10 @@ class MainWindow(QMainWindow):
                                    "Please select a clip to rename.")
             return
         
-        # Get actual filename from item data
         old_filename = current_item.data(Qt.ItemDataRole.UserRole)
         old_path = self.recorder.clips_dir / old_filename
         meta_file = old_path.with_suffix('.meta')
         
-        # Get current custom name if it exists
         current_custom_name = ""
         if meta_file.exists():
             try:
@@ -857,7 +910,6 @@ class MainWindow(QMainWindow):
             except:
                 pass
         
-        # Prompt for new name
         new_name, ok = QInputDialog.getText(
             self, 
             "Rename Clip",
@@ -867,11 +919,9 @@ class MainWindow(QMainWindow):
         )
         
         if ok:
-            # Allow empty string to clear the name
             new_name = new_name.strip()
             
             try:
-                # Read existing metadata
                 timestamp = ""
                 if meta_file.exists():
                     with open(meta_file, 'r') as f:
@@ -881,15 +931,12 @@ class MainWindow(QMainWindow):
                                 timestamp = line.split('=', 1)[1].strip()
                                 break
                 
-                # Write updated metadata
                 with open(meta_file, 'w') as f:
                     f.write(f"timestamp={timestamp}\n")
                     f.write(f"name={new_name}\n")
                 
-                # Refresh the list
                 self.load_clips_list()
                 
-                # Re-select the clip
                 for i in range(self.clips_list.count()):
                     if self.clips_list.item(i).data(Qt.ItemDataRole.UserRole) == old_filename:
                         self.clips_list.setCurrentRow(i)
@@ -911,21 +958,16 @@ class MainWindow(QMainWindow):
                                    "Please select a clip to trim.")
             return
         
-        # Get actual filename from item data
         filename = current_item.data(Qt.ItemDataRole.UserRole)
         clip_path = self.recorder.clips_dir / filename
         
-        # Release viewer's hold on the file first
         if self.viewer.current_clip_path == str(clip_path):
             self.viewer.release_current_clip()
         
-        # Open trim dialog
         dialog = TrimDialog(str(clip_path), self)
         
         if dialog.exec() == QDialog.DialogCode.Accepted:
             start_frame, end_frame = dialog.get_trim_range()
-            
-            # Create trimmed video
             self.create_trimmed_video(str(clip_path), start_frame, end_frame)
     
     def create_trimmed_video(self, source_path, start_frame, end_frame):
@@ -938,17 +980,14 @@ class MainWindow(QMainWindow):
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            # Generate output filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             readable_time = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
             output_path = self.recorder.clips_dir / f"clip_{timestamp}_trimmed.mp4"
             meta_path = output_path.with_suffix('.meta')
             
-            # Create video writer
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
             
-            # Write trimmed frames
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             
             for frame_num in range(start_frame, end_frame + 1):
@@ -960,7 +999,6 @@ class MainWindow(QMainWindow):
             cap.release()
             out.release()
             
-            # Create metadata file for trimmed clip
             with open(meta_path, 'w') as f:
                 f.write(f"timestamp={readable_time}\n")
                 f.write(f"name=(Trimmed)\n")
@@ -968,7 +1006,6 @@ class MainWindow(QMainWindow):
             self.update_status(f"Trimmed clip saved: {output_path.name}")
             self.load_clips_list()
             
-            # Auto-load the new clip
             for i in range(self.clips_list.count()):
                 item = self.clips_list.item(i)
                 if item.data(Qt.ItemDataRole.UserRole) == output_path.name:
@@ -985,9 +1022,8 @@ class MainWindow(QMainWindow):
         clips = sorted(self.recorder.clips_dir.glob("*.mp4"), reverse=True)
         
         for clip in clips:
-            # Try to load metadata
             meta_file = clip.with_suffix('.meta')
-            display_name = clip.stem  # Default to filename without extension
+            display_name = clip.stem
             
             if meta_file.exists():
                 try:
@@ -1009,7 +1045,6 @@ class MainWindow(QMainWindow):
                 except:
                     pass
             
-            # Store the actual filename as data
             from PyQt6.QtWidgets import QListWidgetItem
             item = QListWidgetItem(display_name)
             item.setData(Qt.ItemDataRole.UserRole, clip.name)
@@ -1017,7 +1052,6 @@ class MainWindow(QMainWindow):
     
     def on_clip_selected(self, item):
         """Handle clip selection"""
-        # Get actual filename from item data
         filename = item.data(Qt.ItemDataRole.UserRole)
         clip_path = self.recorder.clips_dir / filename
         self.viewer.load_clip(str(clip_path))
@@ -1032,7 +1066,6 @@ class MainWindow(QMainWindow):
         if not current_item:
             return
         
-        # Get actual filename from item data
         filename = current_item.data(Qt.ItemDataRole.UserRole)
         display_name = current_item.text()
         
@@ -1045,37 +1078,31 @@ class MainWindow(QMainWindow):
             clip_path = self.recorder.clips_dir / filename
             meta_path = clip_path.with_suffix('.meta')
             
-            # Release the clip if it's currently loaded in viewer
             if self.viewer.current_clip_path == str(clip_path):
                 self.viewer.release_current_clip()
             
-            # Try multiple times with increasing delays
             max_attempts = 5
             for attempt in range(max_attempts):
                 try:
-                    # Force garbage collection to ensure file handles are released
                     import gc
                     gc.collect()
                     
-                    # Wait a bit longer on each attempt
                     import time
                     time.sleep(0.2 * (attempt + 1))
                     
-                    # Delete video file
                     if clip_path.exists():
                         clip_path.unlink()
                     
-                    # Delete metadata file if exists
                     if meta_path.exists():
                         meta_path.unlink()
                     
                     self.load_clips_list()
                     self.update_status(f"Deleted {display_name}")
-                    return  # Success!
+                    return
                     
                 except PermissionError as e:
                     if attempt < max_attempts - 1:
-                        continue  # Try again
+                        continue
                     else:
                         self.show_error(f"Failed to delete after {max_attempts} attempts.\n\n"
                                       f"The file is still being used by another process.\n"
@@ -1094,9 +1121,9 @@ class MainWindow(QMainWindow):
         
         if platform.system() == "Windows":
             subprocess.run(["explorer", folder])
-        elif platform.system() == "Darwin":  # macOS
+        elif platform.system() == "Darwin":
             subprocess.run(["open", folder])
-        else:  # Linux
+        else:
             subprocess.run(["xdg-open", folder])
     
     def update_status(self, message):
@@ -1109,13 +1136,9 @@ class MainWindow(QMainWindow):
     
     def closeEvent(self, event):
         """Clean up on close"""
-        # Release viewer's video capture
         self.viewer.release_current_clip()
-        
-        # Stop recording
         self.recorder.stop_recording()
         
-        # Remove hotkeys
         if self.hotkey_registered:
             try:
                 keyboard.unhook_all()
@@ -1131,5 +1154,4 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-
     main()
