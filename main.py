@@ -17,12 +17,14 @@ import keyboard
 import requests
 import json
 from urllib.parse import urlparse
+import platform
 
 class RecorderSignals(QObject):
     """Signals for thread-safe communication"""
     clip_saved = pyqtSignal(str)
     status_update = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    permission_needed = pyqtSignal()
 
 class ScreenRecorder:
     """Handles continuous screen recording and clip saving"""
@@ -36,14 +38,49 @@ class ScreenRecorder:
         self.signals = RecorderSignals()
         self.clips_dir = Path.home() / "ScreenClips"
         self.clips_dir.mkdir(exist_ok=True)
+        self.permission_granted = False
         
+    def check_screen_recording_permission(self):
+        """Check if screen recording permission is granted on macOS"""
+        if platform.system() != "Darwin":  # Not macOS
+            return True
+        
+        try:
+            # Try to capture a small screenshot to test permissions
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                # Try to grab just a 1x1 pixel to minimize overhead
+                test_region = {
+                    "top": monitor["top"],
+                    "left": monitor["left"],
+                    "width": 1,
+                    "height": 1
+                }
+                screenshot = sct.grab(test_region)
+                
+                # If we got here without exception, permission is granted
+                self.permission_granted = True
+                return True
+        except Exception as e:
+            # Permission not granted or other error
+            self.permission_granted = False
+            return False
+    
     def start_recording(self):
         """Start continuous buffer recording"""
+        # Check permissions first on macOS
+        if platform.system() == "Darwin" and not self.permission_granted:
+            if not self.check_screen_recording_permission():
+                self.signals.permission_needed.emit()
+                return False
+        
         if not self.is_recording:
             self.is_recording = True
             self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
             self.record_thread.start()
             self.signals.status_update.emit("Recording buffer active")
+            return True
+        return True
     
     def stop_recording(self):
         """Stop buffer recording"""
@@ -54,29 +91,46 @@ class ScreenRecorder:
     
     def _record_loop(self):
         """Continuously capture screen to buffer"""
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]  # Primary monitor
-            
-            frame_delay = 1.0 / self.fps
-            
-            while self.is_recording:
-                start_time = time.time()
+        try:
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]  # Primary monitor
                 
-                # Capture screen
-                screenshot = sct.grab(monitor)
-                frame = np.array(screenshot)
+                frame_delay = 1.0 / self.fps
                 
-                # Convert BGRA to BGR
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                
-                # Add timestamp
-                timestamp = datetime.now()
-                self.frame_buffer.append((frame, timestamp))
-                
-                # Maintain target FPS
-                elapsed = time.time() - start_time
-                sleep_time = max(0, frame_delay - elapsed)
-                time.sleep(sleep_time)
+                while self.is_recording:
+                    start_time = time.time()
+                    
+                    try:
+                        # Capture screen
+                        screenshot = sct.grab(monitor)
+                        frame = np.array(screenshot)
+                        
+                        # Convert BGRA to BGR
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                        
+                        # Add timestamp
+                        timestamp = datetime.now()
+                        self.frame_buffer.append((frame, timestamp))
+                        
+                    except Exception as e:
+                        if platform.system() == "Darwin":
+                            # Permission was revoked
+                            self.signals.error_occurred.emit("Screen recording permission lost")
+                            self.is_recording = False
+                            self.permission_granted = False
+                            self.signals.permission_needed.emit()
+                            break
+                        else:
+                            raise
+                    
+                    # Maintain target FPS
+                    elapsed = time.time() - start_time
+                    sleep_time = max(0, frame_delay - elapsed)
+                    time.sleep(sleep_time)
+                    
+        except Exception as e:
+            self.signals.error_occurred.emit(f"Recording error: {str(e)}")
+            self.is_recording = False
     
     def save_clip(self, duration_seconds=None):
         """Save the last N seconds from buffer"""
@@ -470,7 +524,7 @@ class MainWindow(QMainWindow):
         self.setup_signals()
         self.load_clips_list()
         
-        # Auto-start recording
+        # Auto-start recording after checking permissions
         QTimer.singleShot(500, self.auto_start_recording)
         
         # Auto-enable hotkey
@@ -537,6 +591,10 @@ class MainWindow(QMainWindow):
         self.delete_btn.clicked.connect(self.delete_clip)
         clip_actions.addWidget(self.delete_btn)
         
+        self.upload_btn = QPushButton("Upload Clip")
+        self.upload_btn.clicked.connect(self.upload_clip)
+        clip_actions.addWidget(self.upload_btn)
+        
         left_panel.addLayout(clip_actions)
         
         # Open folder button
@@ -551,23 +609,53 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.viewer, 2)
         
         central.setLayout(main_layout)
-
-        # Upload button
-        self.upload_btn = QPushButton("Upload Clip")
-        self.upload_btn.clicked.connect(self.upload_clip)
-        clip_actions.addWidget(self.upload_btn)
     
     def setup_signals(self):
         """Connect recorder signals"""
         self.recorder.signals.clip_saved.connect(self.on_clip_saved)
         self.recorder.signals.status_update.connect(self.update_status)
         self.recorder.signals.error_occurred.connect(self.show_error)
+        self.recorder.signals.permission_needed.connect(self.show_permission_dialog)
+    
+    def show_permission_dialog(self):
+        """Show macOS permission instructions"""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Screen Recording Permission Required")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(
+            "<b>Screen Recording Permission Needed</b><br><br>"
+            "This app needs permission to record your screen.<br><br>"
+            "<b>To grant permission:</b><br>"
+            "1. Open <b>System Settings</b><br>"
+            "2. Go to <b>Privacy & Security</b> → <b>Screen Recording</b><br>"
+            "3. Enable permission for <b>Terminal</b> or <b>Python</b><br>"
+            "4. Restart this application<br><br>"
+            "The app will open System Settings for you when you click OK."
+        )
+        
+        open_settings_btn = msg.addButton("Open System Settings", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        
+        result = msg.exec()
+        
+        if msg.clickedButton() == open_settings_btn:
+            import subprocess
+            # Open System Settings to Privacy & Security > Screen Recording
+            subprocess.run([
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            ])
+        
+        self.update_status("Waiting for screen recording permission...")
+        self.start_btn.setText("Start Recording Buffer")
     
     def auto_start_recording(self):
         """Auto-start recording on launch"""
         if not self.recorder.is_recording:
-            self.recorder.start_recording()
-            self.update_status("Recording buffer active (auto-started)")
+            success = self.recorder.start_recording()
+            if success:
+                self.update_status("Recording buffer active (auto-started)")
+            # If it fails, the permission dialog will be shown automatically
     
     def upload_clip(self):
         """Upload selected clip to a free hosting service"""
@@ -601,7 +689,7 @@ class MainWindow(QMainWindow):
                     response = requests.post(
                         'https://file.io',
                         files=files,
-                        data={'expires': '14d'}  # 14 days retention
+                        data={'expires': '14d'}
                     )
                     
                     if response.status_code == 200:
@@ -613,10 +701,10 @@ class MainWindow(QMainWindow):
                 except:
                     pass
                 
-                # If File.io fails, try 0x0.st (free, no guaranteed retention but usually long)
+                # If File.io fails, try 0x0.st
                 if not upload_success:
                     try:
-                        f.seek(0)  # Reset file pointer
+                        f.seek(0)
                         response = requests.post(
                             'https://0x0.st',
                             files={'file': f}
@@ -629,10 +717,10 @@ class MainWindow(QMainWindow):
                     except:
                         pass
                 
-                # If both fail, try tmpfiles.org (30 days retention)
+                # If both fail, try tmpfiles.org
                 if not upload_success:
                     try:
-                        f.seek(0)  # Reset file pointer
+                        f.seek(0)
                         response = requests.post(
                             'https://tmpfiles.org/api/v1/upload',
                             files={'file': f}
@@ -641,7 +729,6 @@ class MainWindow(QMainWindow):
                         if response.status_code == 200:
                             result = response.json()
                             if result.get('status') == 'success':
-                                # Convert to direct download link
                                 file_url = result['data']['url']
                                 download_url = file_url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
                                 upload_success = True
@@ -650,10 +737,7 @@ class MainWindow(QMainWindow):
                         pass
             
             if upload_success and download_url:
-                # Copy to clipboard
                 QApplication.clipboard().setText(download_url)
-                
-                # Show success dialog with copy options
                 self.show_upload_success(download_url, filename)
             else:
                 self.show_error("All upload services failed. Please try again later.")
@@ -1047,4 +1131,5 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
+
     main()
