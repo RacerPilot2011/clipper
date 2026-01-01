@@ -718,125 +718,166 @@ class MainWindow(QMainWindow):
                 self.update_status("Recording buffer active (auto-started)")
     
     def upload_clip(self):
-        """Upload selected clip to a free hosting service"""
-        current_item = self.clips_list.currentItem()
-        if not current_item:
-            QMessageBox.information(self, "No Clip Selected", 
-                                "Please select a clip to upload.")
-            return
+    """Upload selected clip to cloud server"""
+    current_item = self.clips_list.currentItem()
+    if not current_item:
+        QMessageBox.information(self, "No Clip Selected", 
+                            "Please select a clip to upload.")
+        return
+    
+    filename = current_item.data(Qt.ItemDataRole.UserRole)
+    clip_path = self.recorder.clips_dir / filename
+    
+    if not clip_path.exists():
+        self.show_error("Clip file does not exist.")
+        return
+    
+    # Check file size
+    file_size = clip_path.stat().st_size
+    file_size_mb = file_size / (1024 * 1024)
+    
+    # Get server URL from settings or use default
+    if not hasattr(self, 'server_url') or not self.server_url:
+        # Prompt for server URL on first upload
+        self.server_url = self.prompt_server_url()
+    
+    if not self.server_url:
+        return  # User cancelled
+    
+    # Check file size limit
+    if file_size_mb > 50:
+        self.show_error(
+            f"File too large ({file_size_mb:.1f}MB)\n\n"
+            "The server has a 50MB limit.\n"
+            "Please trim your clip to reduce file size."
+        )
+        return
+    
+    try:
+        self.update_status(f"Uploading clip ({file_size_mb:.1f}MB)...")
+        QApplication.processEvents()
         
-        filename = current_item.data(Qt.ItemDataRole.UserRole)
-        clip_path = self.recorder.clips_dir / filename
-        
-        if not clip_path.exists():
-            self.show_error("Clip file does not exist.")
-            return
-        
-        try:
-            self.update_status("Uploading clip...")
+        with open(clip_path, 'rb') as f:
+            files = {'file': (filename, f, 'video/mp4')}
             
-            with open(clip_path, 'rb') as f:
-                files = {'file': (filename, f, 'video/mp4')}
+            response = requests.post(
+                f'{self.server_url}/api/upload',
+                files=files,
+                timeout=300
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
                 
-                upload_success = False
-                download_url = ""
-                
-                # Try File.io first
-                try:
-                    response = requests.post(
-                        'https://file.io',
-                        files=files,
-                        data={'expires': '14d'}
-                    )
+                if result.get('success'):
+                    clip_url = result['url']
+                    direct_url = result['direct_url']
                     
-                    if response.status_code == 200:
-                        result = response.json()
-                        if result.get('success'):
-                            download_url = result['link']
-                            upload_success = True
-                            self.update_status("Uploaded to File.io (14 days)")
+                    # Copy URL to clipboard
+                    QApplication.clipboard().setText(clip_url)
+                    
+                    self.update_status(f"Upload successful!")
+                    self.show_upload_success(clip_url, direct_url, filename)
+                else:
+                    self.show_error(f"Upload failed: {result.get('error', 'Unknown error')}")
+            else:
+                error_msg = "Unknown error"
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('error', error_msg)
                 except:
                     pass
                 
-                # If File.io fails, try 0x0.st
-                if not upload_success:
-                    try:
-                        f.seek(0)
-                        response = requests.post(
-                            'https://0x0.st',
-                            files={'file': f}
-                        )
-                        
-                        if response.status_code == 200:
-                            download_url = response.text.strip()
-                            upload_success = True
-                            self.update_status("Uploaded to 0x0.st")
-                    except:
-                        pass
+                self.show_error(
+                    f"Upload failed: {error_msg}\n\n"
+                    f"Status code: {response.status_code}"
+                )
                 
-                # If both fail, try tmpfiles.org
-                if not upload_success:
-                    try:
-                        f.seek(0)
-                        response = requests.post(
-                            'https://tmpfiles.org/api/v1/upload',
-                            files={'file': f}
-                        )
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            if result.get('status') == 'success':
-                                file_url = result['data']['url']
-                                download_url = file_url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
-                                upload_success = True
-                                self.update_status("Uploaded to tmpfiles.org (30 days)")
-                    except:
-                        pass
-            
-            if upload_success and download_url:
-                QApplication.clipboard().setText(download_url)
-                self.show_upload_success(download_url, filename)
-            else:
-                self.show_error("All upload services failed. Please try again later.")
-                
-        except Exception as e:
-            self.show_error(f"Upload error: {str(e)}")
+    except requests.exceptions.ConnectionError:
+        self.show_error(
+            f"Could not connect to server\n\n"
+            f"URL: {self.server_url}\n\n"
+            "Please check:\n"
+            "• Is the URL correct?\n"
+            "• Is the server running?\n"
+            "• Is your internet working?"
+        )
+        # Clear saved URL so user can try a different one
+        self.server_url = None
+        
+    except requests.exceptions.Timeout:
+        self.show_error(
+            "Upload timed out\n\n"
+            "This could be because:\n"
+            "• The file is very large\n"
+            "• Your internet is slow\n"
+            "• The server is not responding\n\n"
+            "Try trimming the clip to reduce file size."
+        )
+    except Exception as e:
+        self.show_error(f"Upload error: {str(e)}")
 
-    def show_upload_success(self, url, filename):
-        """Show upload success dialog with options"""
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Upload Successful")
-        msg.setIcon(QMessageBox.Icon.Information)
-        
-        message = f"""
-        <b>Clip uploaded successfully!</b>
-        
-        <b>File:</b> {filename}
-        <b>URL:</b> <a href="{url}">{url}</a>
-        
-        The URL has been copied to your clipboard and should be available for at least 10-30 days.
-        
-        You can now:
-        • Share this link with others
-        • Open it in your browser
-        • Use it on the clips website
-        """
-        
-        msg.setText(message)
-        msg.setTextFormat(Qt.TextFormat.RichText)
-        
-        msg.addButton("Open in Browser", QMessageBox.ButtonRole.AcceptRole)
-        msg.addButton("Copy URL Again", QMessageBox.ButtonRole.ActionRole)
-        msg.addButton("OK", QMessageBox.ButtonRole.RejectRole)
-        
-        result = msg.exec()
-        
-        if result == 0:  # Open in Browser
-            import webbrowser
-            webbrowser.open(url)
-        elif result == 1:  # Copy URL Again
-            QApplication.clipboard().setText(url)
-            self.update_status("URL copied to clipboard again")
+def prompt_server_url(self):
+    """Prompt user for server URL"""
+    from PyQt6.QtWidgets import QInputDialog
+    
+    # Provide helpful default examples
+    default_url = "https://your-app.railway.app"
+    
+    dialog = QInputDialog(self)
+    dialog.setWindowTitle("Server URL")
+    dialog.setLabelText(
+        "Enter your Screen Clips server URL:\n\n"
+        "Examples:\n"
+        "• https://your-app.railway.app\n"
+        "• https://your-app.onrender.com\n"
+        "• https://your-app.fly.dev\n"
+        "• http://localhost:5000 (local testing)"
+    )
+    dialog.setTextValue(default_url)
+    dialog.resize(500, 200)
+    
+    if dialog.exec() == QInputDialog.DialogCode.Accepted:
+        url = dialog.textValue().strip().rstrip('/')
+        if url:
+            # Validate URL format
+            if not url.startswith('http://') and not url.startswith('https://'):
+                self.show_error("URL must start with http:// or https://")
+                return self.prompt_server_url()  # Try again
+            return url
+    
+    return None
+
+def show_upload_success(self, clip_url, direct_url, filename):
+    """Show upload success dialog"""
+    msg = QMessageBox(self)
+    msg.setWindowTitle("Upload Successful!")
+    msg.setIcon(QMessageBox.Icon.Information)
+    
+    message = f"""
+<b>✓ Clip uploaded successfully!</b><br><br>
+<b>File:</b> {filename}<br>
+<b>Watch URL:</b> <a href="{clip_url}">{clip_url}</a><br><br>
+<i>The URL has been copied to your clipboard.</i><br><br>
+Share this link with anyone to let them watch your clip!
+    """
+    
+    msg.setText(message)
+    msg.setTextFormat(Qt.TextFormat.RichText)
+    
+    open_btn = msg.addButton("Open in Browser", QMessageBox.ButtonRole.AcceptRole)
+    copy_btn = msg.addButton("Copy URL Again", QMessageBox.ButtonRole.ActionRole)
+    ok_btn = msg.addButton("OK", QMessageBox.ButtonRole.RejectRole)
+    
+    msg.exec()
+    
+    clicked = msg.clickedButton()
+    if clicked == open_btn:
+        import webbrowser
+        webbrowser.open(clip_url)
+    elif clicked == copy_btn:
+        QApplication.clipboard().setText(clip_url)
+        self.update_status("URL copied to clipboard")
     
     def auto_enable_hotkey(self):
         """Auto-enable hotkey on launch"""
@@ -1155,3 +1196,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
