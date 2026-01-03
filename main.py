@@ -206,28 +206,52 @@ class ScreenRecorder:
                     return False
             return True
         
+        # For macOS, we need to check permissions properly
+        # The permission check itself will trigger the prompt on first run
+        # We cache the result to avoid repeated prompts
+        if hasattr(self, '_mac_permission_checked') and self._mac_permission_checked:
+            return self.permission_granted
+        
+        self._mac_permission_checked = True
+        
         try:
-            with mss.mss() as sct:
-                monitor = sct.monitors[1]
-                test_region = {
-                    "top": monitor["top"],
-                    "left": monitor["left"],
-                    "width": 1,
-                    "height": 1
-                }
-                screenshot = sct.grab(test_region)
-                self.permission_granted = True
-                return True
+            # Single permission check - don't create multiple mss instances
+            if not hasattr(self, '_permission_test_done'):
+                self._permission_test_done = True
+                with mss.mss() as sct:
+                    monitor = sct.monitors[1]
+                    test_region = {
+                        "top": monitor["top"],
+                        "left": monitor["left"],
+                        "width": 10,
+                        "height": 10
+                    }
+                    screenshot = sct.grab(test_region)
+                    # Check if we got actual pixel data
+                    img = np.array(screenshot)
+                    if img.size > 0 and not np.all(img == 0):
+                        self.permission_granted = True
+                        return True
+                    else:
+                        self.permission_granted = False
+                        return False
+            return self.permission_granted
         except Exception as e:
+            print(f"Permission check error: {e}")
             self.permission_granted = False
             return False
     
     def start_recording(self):
         """Start continuous buffer recording"""
-        if platform.system() == "Darwin" and not self.permission_granted:
-            if not self.check_screen_recording_permission():
-                self.signals.permission_needed.emit()
-                return False
+        # For macOS, only check permission once at startup
+        if platform.system() == "Darwin":
+            if not hasattr(self, '_initial_permission_check_done'):
+                self._initial_permission_check_done = True
+                if not self.check_screen_recording_permission():
+                    self.signals.permission_needed.emit()
+                    return False
+                # Small delay to ensure permission dialog is handled
+                time.sleep(0.5)
         
         if not self.is_recording:
             self.is_recording = True
@@ -264,7 +288,10 @@ class ScreenRecorder:
     def _record_loop(self):
         """Continuously capture screen to buffer"""
         try:
+            # Create persistent mss instance for this thread
+            # Reuse the same instance to avoid repeated permission prompts on macOS
             self.sct = mss.mss()
+            
             monitor = self.sct.monitors[1]
             
             if platform.system() == "Linux":
@@ -277,6 +304,8 @@ class ScreenRecorder:
                 }
             
             frame_delay = 1.0 / self.fps
+            consecutive_errors = 0
+            max_consecutive_errors = 10
             
             while self.is_recording:
                 start_time = time.time()
@@ -284,6 +313,23 @@ class ScreenRecorder:
                 try:
                     screenshot = self.sct.grab(monitor)
                     frame = np.array(screenshot)
+                    
+                    # macOS specific: Check if we got black/empty frames (permission issue)
+                    if platform.system() == "Darwin":
+                        if frame.size == 0 or np.all(frame == 0):
+                            consecutive_errors += 1
+                            if consecutive_errors >= max_consecutive_errors:
+                                self.signals.error_occurred.emit(
+                                    "Screen recording permission may have been denied.\n\n"
+                                    "Please grant permission in System Settings:\n"
+                                    "Privacy & Security → Screen Recording"
+                                )
+                                self.is_recording = False
+                                break
+                            time.sleep(0.5)
+                            continue
+                    
+                    consecutive_errors = 0  # Reset on successful frame
                     
                     if frame.shape[2] == 4:
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
@@ -295,26 +341,34 @@ class ScreenRecorder:
                     
                 except Exception as e:
                     error_msg = str(e)
+                    consecutive_errors += 1
                     
-                    if "XGetImage" in error_msg or "X11" in error_msg:
-                        self.signals.error_occurred.emit(
-                            "X11 capture error. Try:\n"
-                            "1. Run: xhost +local:\n"
-                            "2. Or set DISPLAY variable\n"
-                            "3. Check if running in Wayland (may need XWayland)"
-                        )
+                    if consecutive_errors >= max_consecutive_errors:
+                        if "XGetImage" in error_msg or "X11" in error_msg:
+                            self.signals.error_occurred.emit(
+                                "X11 capture error. Try:\n"
+                                "1. Run: xhost +local:\n"
+                                "2. Or set DISPLAY variable\n"
+                                "3. Check if running in Wayland (may need XWayland)"
+                            )
+                        elif platform.system() == "Darwin":
+                            self.signals.error_occurred.emit(
+                                "Screen recording failed.\n\n"
+                                "Please:\n"
+                                "1. Quit this application completely\n"
+                                "2. Open System Settings → Privacy & Security → Screen Recording\n"
+                                "3. Enable permission for Python/Terminal\n"
+                                "4. Restart this application\n\n"
+                                "Note: Do NOT run with sudo - it causes permission issues."
+                            )
+                        else:
+                            self.signals.error_occurred.emit(f"Recording error: {error_msg}")
+                        
                         self.is_recording = False
                         break
-                    elif platform.system() == "Darwin":
-                        self.signals.error_occurred.emit("Screen recording permission lost")
-                        self.is_recording = False
-                        self.permission_granted = False
-                        self.signals.permission_needed.emit()
-                        break
-                    else:
-                        print(f"Frame capture error: {e}")
-                        time.sleep(0.5)
-                        continue
+                    
+                    time.sleep(0.5)
+                    continue
                 
                 elapsed = time.time() - start_time
                 sleep_time = max(0, frame_delay - elapsed)
@@ -1055,14 +1109,20 @@ class MainWindow(QMainWindow):
         msg.setText(
             "<b>Screen Recording Permission Needed</b><br><br>"
             "This app needs permission to record your screen.<br><br>"
+            "<b>⚠️ IMPORTANT: Do NOT run with sudo!</b><br>"
+            "Running with sudo causes permission issues.<br><br>"
             "<b>To grant permission:</b><br>"
-            "1. Open <b>System Settings</b><br>"
-            "2. Go to <b>Privacy & Security</b> → <b>Screen Recording</b><br>"
-            "3. Enable permission for <b>Terminal</b> or <b>Python</b><br>"
-            "4. Restart this application"
+            "1. Quit this application completely (Cmd+Q)<br>"
+            "2. Open <b>System Settings</b> (Apple menu → System Settings)<br>"
+            "3. Go to <b>Privacy & Security</b> → <b>Screen Recording</b><br>"
+            "4. Look for <b>Terminal</b>, <b>Python</b>, or <b>iTerm</b><br>"
+            "5. Enable the checkbox next to it<br>"
+            "6. Restart this application normally (without sudo)<br><br>"
+            "<i>The permission change requires a complete restart of the app.</i>"
         )
         
         open_settings_btn = msg.addButton("Open System Settings", QMessageBox.ButtonRole.AcceptRole)
+        quit_btn = msg.addButton("Quit App", QMessageBox.ButtonRole.DestructiveRole)
         msg.addButton("Later", QMessageBox.ButtonRole.RejectRole)
         
         result = msg.exec()
@@ -1073,15 +1133,37 @@ class MainWindow(QMainWindow):
                 "open",
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
             ])
+            # Also show instructions
+            QMessageBox.information(self, "Next Steps",
+                "After enabling Screen Recording permission:\n\n"
+                "1. Completely quit this app (Cmd+Q)\n"
+                "2. Restart the app normally\n\n"
+                "The permission will only work after a full restart."
+            )
+        elif msg.clickedButton() == quit_btn:
+            QApplication.quit()
+            sys.exit(0)
         
         self.update_status("Waiting for screen recording permission...")
         self.start_btn.setText("Start Recording Buffer")
+        self.start_btn.setEnabled(False)
     
     def auto_start_recording(self):
         if not self.recorder.is_recording:
+            # On macOS, be extra careful about auto-starting
+            if platform.system() == "Darwin":
+                # Only auto-start if we haven't shown the permission dialog
+                if hasattr(self.recorder, 'permission_granted') and not self.recorder.permission_granted:
+                    self.update_status("Screen recording permission needed - click 'Start Recording Buffer' to begin")
+                    self.start_btn.setText("Start Recording Buffer")
+                    self.start_btn.setEnabled(True)
+                    return
+            
             success = self.recorder.start_recording()
             if success:
                 self.update_status("Recording buffer active (auto-started)")
+            else:
+                self.start_btn.setEnabled(True)
     
     def auto_enable_hotkey(self):
         if not self.hotkey_registered:
@@ -1522,7 +1604,32 @@ class MainWindow(QMainWindow):
         event.accept()
 
 def main():
+    # Check if running with sudo on macOS
+    if platform.system() == "Darwin":
+        if os.geteuid() == 0:
+            print("\n" + "="*60)
+            print("⚠️  WARNING: Running with sudo is NOT recommended!")
+            print("="*60)
+            print("\nThis causes screen recording permission issues on macOS.")
+            print("\nPlease:")
+            print("1. Quit this app (Ctrl+C)")
+            print("2. Run without sudo: python screen_recorder.py")
+            print("3. Grant screen recording permission when prompted")
+            print("\n" + "="*60 + "\n")
+            
+            response = input("Continue anyway? (not recommended) [y/N]: ")
+            if response.lower() != 'y':
+                print("Exiting. Please run without sudo.")
+                sys.exit(1)
+    
     app = QApplication(sys.argv)
+    
+    # macOS specific: Check for screen recording permission before showing UI
+    if platform.system() == "Darwin":
+        print("\nChecking screen recording permissions...")
+        print("Note: A system dialog may appear requesting permission.")
+        print("This is normal on first run.\n")
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
