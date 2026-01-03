@@ -10,9 +10,7 @@ jobs:
     strategy:
       matrix:
         os: [macos-latest, windows-latest, ubuntu-latest]
-
     runs-on: ${{ matrix.os }}
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -20,7 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.13" # Downgraded from 3.14 to ensure PyInstaller support
 
       - name: Install dependencies
         run: |
@@ -31,24 +29,30 @@ jobs:
       - name: Build app (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller \
-            --windowed \
-            --name Clipper \
-            main.py
+          pyinstaller --clean --windowed --name Clipper main.py
 
       - name: Build app (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --onefile --name Clipper main.py
+          pyinstaller --clean --onefile --name Clipper main.py
 
       - name: Build app (Linux)
         if: runner.os == 'Linux'
         run: |
-          pyinstaller --onefile --name Clipper main.py
+          pyinstaller --clean --onefile --name Clipper main.py
+
+      # This step simplifies uploading by zipping the macOS app bundle first
+      - name: Zip macOS App (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -r Clipper-macOS.zip Clipper.app
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Clipper-${{ runner.os }}
           path: |
-            dist/**
+            dist/*.exe
+            dist/*.zip
+            dist/Clipper
