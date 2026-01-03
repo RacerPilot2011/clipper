@@ -10,7 +10,8 @@ import mss
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QListWidget, 
                              QMessageBox, QFileDialog, QSlider, QSpinBox,
-                             QDialog, QDialogButtonBox, QLineEdit, QInputDialog)
+                             QDialog, QDialogButtonBox, QLineEdit, QInputDialog,
+                             QCheckBox, QComboBox, QGroupBox)
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QObject
 from PyQt6.QtGui import QPixmap, QImage
 import keyboard
@@ -19,6 +20,18 @@ import json
 from urllib.parse import urlparse
 import platform
 import os
+import tempfile
+import subprocess
+
+# Audio recording imports
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+    print("Warning: sounddevice/soundfile not available. Audio recording disabled.")
+    print("Install with: pip install sounddevice soundfile")
 
 class RecorderSignals(QObject):
     """Signals for thread-safe communication"""
@@ -26,6 +39,146 @@ class RecorderSignals(QObject):
     status_update = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     permission_needed = pyqtSignal()
+    audio_devices_found = pyqtSignal(list, list)
+
+class AudioRecorder:
+    """Handles audio recording from microphone and desktop"""
+    
+    def __init__(self, sample_rate=44100):
+        self.sample_rate = sample_rate
+        self.is_recording = False
+        self.mic_enabled = False
+        self.desktop_enabled = False
+        self.mic_device = None
+        self.desktop_device = None
+        self.mic_buffer = deque()
+        self.desktop_buffer = deque()
+        self.record_thread = None
+        self.lock = threading.Lock()
+        
+    def get_audio_devices(self):
+        """Get available audio input devices"""
+        if not AUDIO_AVAILABLE:
+            return [], []
+        
+        try:
+            devices = sd.query_devices()
+            input_devices = []
+            output_devices = []
+            
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    input_devices.append({
+                        'index': i,
+                        'name': device['name'],
+                        'channels': device['max_input_channels']
+                    })
+                if device['max_output_channels'] > 0:
+                    output_devices.append({
+                        'index': i,
+                        'name': device['name'],
+                        'channels': device['max_output_channels']
+                    })
+            
+            return input_devices, output_devices
+        except Exception as e:
+            print(f"Error getting audio devices: {e}")
+            return [], []
+    
+    def start_recording(self):
+        """Start audio recording"""
+        if not AUDIO_AVAILABLE:
+            return False
+        
+        if not self.mic_enabled and not self.desktop_enabled:
+            return False
+        
+        self.is_recording = True
+        self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
+        self.record_thread.start()
+        return True
+    
+    def stop_recording(self):
+        """Stop audio recording"""
+        self.is_recording = False
+        if self.record_thread:
+            self.record_thread.join(timeout=2)
+    
+    def _record_loop(self):
+        """Audio recording loop"""
+        try:
+            # Determine which streams to open
+            streams = []
+            
+            if self.mic_enabled and self.mic_device is not None:
+                try:
+                    mic_stream = sd.InputStream(
+                        device=self.mic_device,
+                        channels=1,
+                        samplerate=self.sample_rate,
+                        callback=lambda indata, frames, time, status: self._mic_callback(indata, frames, time, status)
+                    )
+                    streams.append(('mic', mic_stream))
+                except Exception as e:
+                    print(f"Failed to open mic stream: {e}")
+            
+            if self.desktop_enabled and self.desktop_device is not None:
+                try:
+                    # For desktop audio, we try to use loopback/stereo mix
+                    desktop_stream = sd.InputStream(
+                        device=self.desktop_device,
+                        channels=2,
+                        samplerate=self.sample_rate,
+                        callback=lambda indata, frames, time, status: self._desktop_callback(indata, frames, time, status)
+                    )
+                    streams.append(('desktop', desktop_stream))
+                except Exception as e:
+                    print(f"Failed to open desktop stream: {e}")
+            
+            if not streams:
+                return
+            
+            # Start all streams
+            for name, stream in streams:
+                stream.start()
+            
+            # Keep recording while active
+            while self.is_recording:
+                time.sleep(0.1)
+            
+            # Stop all streams
+            for name, stream in streams:
+                stream.stop()
+                stream.close()
+                
+        except Exception as e:
+            print(f"Audio recording error: {e}")
+    
+    def _mic_callback(self, indata, frames, time_info, status):
+        """Callback for microphone audio"""
+        with self.lock:
+            self.mic_buffer.append(indata.copy())
+    
+    def _desktop_callback(self, indata, frames, time_info, status):
+        """Callback for desktop audio"""
+        with self.lock:
+            self.desktop_buffer.append(indata.copy())
+    
+    def get_audio_data(self):
+        """Get recorded audio data and clear buffers"""
+        with self.lock:
+            mic_data = list(self.mic_buffer)
+            desktop_data = list(self.desktop_buffer)
+            self.mic_buffer.clear()
+            self.desktop_buffer.clear()
+        
+        return mic_data, desktop_data
+    
+    def clear_buffers(self):
+        """Clear audio buffers"""
+        with self.lock:
+            self.mic_buffer.clear()
+            self.desktop_buffer.clear()
 
 class ScreenRecorder:
     """Handles continuous screen recording and clip saving"""
@@ -42,17 +195,18 @@ class ScreenRecorder:
         self.permission_granted = False
         self.sct = None
         
+        # Audio recorder
+        self.audio_recorder = AudioRecorder() if AUDIO_AVAILABLE else None
+        
     def check_screen_recording_permission(self):
         """Check if screen recording permission is granted"""
-        if platform.system() != "Darwin":  # Not macOS
-            # For Linux, check if DISPLAY is set
+        if platform.system() != "Darwin":
             if platform.system() == "Linux":
                 if not os.environ.get('DISPLAY'):
                     return False
             return True
         
         try:
-            # Try to capture a small screenshot to test permissions
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
                 test_region = {
@@ -62,7 +216,6 @@ class ScreenRecorder:
                     "height": 1
                 }
                 screenshot = sct.grab(test_region)
-                
                 self.permission_granted = True
                 return True
         except Exception as e:
@@ -71,7 +224,6 @@ class ScreenRecorder:
     
     def start_recording(self):
         """Start continuous buffer recording"""
-        # Check permissions first on macOS
         if platform.system() == "Darwin" and not self.permission_granted:
             if not self.check_screen_recording_permission():
                 self.signals.permission_needed.emit()
@@ -81,6 +233,11 @@ class ScreenRecorder:
             self.is_recording = True
             self.record_thread = threading.Thread(target=self._record_loop, daemon=True)
             self.record_thread.start()
+            
+            # Start audio recording if enabled
+            if self.audio_recorder:
+                self.audio_recorder.start_recording()
+            
             self.signals.status_update.emit("Recording buffer active")
             return True
         return True
@@ -91,7 +248,10 @@ class ScreenRecorder:
         if self.record_thread:
             self.record_thread.join(timeout=2)
         
-        # Close mss instance
+        # Stop audio recording
+        if self.audio_recorder:
+            self.audio_recorder.stop_recording()
+        
         if self.sct:
             try:
                 self.sct.close()
@@ -104,15 +264,10 @@ class ScreenRecorder:
     def _record_loop(self):
         """Continuously capture screen to buffer"""
         try:
-            # Create persistent mss instance for this thread
             self.sct = mss.mss()
+            monitor = self.sct.monitors[1]
             
-            # Get monitor info
-            monitor = self.sct.monitors[1]  # Primary monitor
-            
-            # For Linux, ensure we're capturing the full screen correctly
             if platform.system() == "Linux":
-                # Sometimes mss needs explicit monitor bounds
                 monitor = {
                     "top": 0,
                     "left": 0,
@@ -127,19 +282,14 @@ class ScreenRecorder:
                 start_time = time.time()
                 
                 try:
-                    # Capture screen with error handling
                     screenshot = self.sct.grab(monitor)
-                    
-                    # Convert to numpy array
                     frame = np.array(screenshot)
                     
-                    # Convert BGRA to BGR
                     if frame.shape[2] == 4:
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                     elif frame.shape[2] == 3:
                         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     
-                    # Add timestamp
                     timestamp = datetime.now()
                     self.frame_buffer.append((frame, timestamp))
                     
@@ -156,24 +306,20 @@ class ScreenRecorder:
                         self.is_recording = False
                         break
                     elif platform.system() == "Darwin":
-                        # Permission was revoked
                         self.signals.error_occurred.emit("Screen recording permission lost")
                         self.is_recording = False
                         self.permission_granted = False
                         self.signals.permission_needed.emit()
                         break
                     else:
-                        # Other error, but try to continue
                         print(f"Frame capture error: {e}")
                         time.sleep(0.5)
                         continue
                 
-                # Maintain target FPS
                 elapsed = time.time() - start_time
                 sleep_time = max(0, frame_delay - elapsed)
                 time.sleep(sleep_time)
             
-            # Clean up mss instance
             if self.sct:
                 try:
                     self.sct.close()
@@ -185,7 +331,6 @@ class ScreenRecorder:
             self.signals.error_occurred.emit(f"Recording error: {str(e)}")
             self.is_recording = False
             
-            # Clean up on error
             if self.sct:
                 try:
                     self.sct.close()
@@ -202,58 +347,155 @@ class ScreenRecorder:
         if duration_seconds is None:
             duration_seconds = self.buffer_seconds
         
-        # Calculate how many frames to save
         frames_to_save = min(int(duration_seconds * self.fps), len(self.frame_buffer))
         
         if frames_to_save == 0:
             self.signals.error_occurred.emit("Not enough frames")
             return None
         
-        # Get frames from end of buffer
         frames_list = list(self.frame_buffer)[-frames_to_save:]
         
-        # Generate filename with metadata
+        # Get audio data if available
+        mic_data, desktop_data = None, None
+        if self.audio_recorder and AUDIO_AVAILABLE:
+            mic_data, desktop_data = self.audio_recorder.get_audio_data()
+        
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         readable_time = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
         filename = self.clips_dir / f"clip_{timestamp}.mp4"
         metadata_file = self.clips_dir / f"clip_{timestamp}.meta"
         
-        # Save video in background thread
         threading.Thread(target=self._save_video, 
-                        args=(frames_list, filename, metadata_file, readable_time), 
+                        args=(frames_list, filename, metadata_file, readable_time, mic_data, desktop_data), 
                         daemon=True).start()
         
         return str(filename)
     
-    def _save_video(self, frames_list, filename, metadata_file, readable_time):
-        """Save frames to video file"""
+    def _save_video(self, frames_list, filename, metadata_file, readable_time, mic_data, desktop_data):
+        """Save frames to video file with audio"""
         try:
             if not frames_list:
                 return
             
-            # Get frame dimensions
             height, width = frames_list[0][0].shape[:2]
             
-            # Create video writer
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(str(filename), fourcc, self.fps, (width, height))
+            # Save temporary video without audio
+            temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+            temp_video_path = temp_video.name
+            temp_video.close()
             
-            # Write frames
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(temp_video_path, fourcc, self.fps, (width, height))
+            
             for frame, _ in frames_list:
                 out.write(frame)
             
             out.release()
             
-            # Save metadata file with timestamp and custom name
+            # Process audio if available
+            has_audio = False
+            temp_audio_files = []
+            
+            if AUDIO_AVAILABLE and (mic_data or desktop_data):
+                try:
+                    # Save mic audio
+                    if mic_data and len(mic_data) > 0:
+                        mic_audio_path = tempfile.NamedTemporaryFile(suffix='.wav', delete=False).name
+                        mic_audio = np.concatenate(mic_data, axis=0)
+                        sf.write(mic_audio_path, mic_audio, self.audio_recorder.sample_rate)
+                        temp_audio_files.append(('mic', mic_audio_path))
+                    
+                    # Save desktop audio
+                    if desktop_data and len(desktop_data) > 0:
+                        desktop_audio_path = tempfile.NamedTemporaryFile(suffix='.wav', delete=False).name
+                        desktop_audio = np.concatenate(desktop_data, axis=0)
+                        sf.write(desktop_audio_path, desktop_audio, self.audio_recorder.sample_rate)
+                        temp_audio_files.append(('desktop', desktop_audio_path))
+                    
+                    if temp_audio_files:
+                        has_audio = True
+                except Exception as e:
+                    print(f"Audio processing error: {e}")
+            
+            # Combine video and audio using ffmpeg
+            if has_audio and self._check_ffmpeg():
+                try:
+                    self._merge_video_audio(temp_video_path, temp_audio_files, str(filename))
+                except Exception as e:
+                    print(f"FFmpeg merge error: {e}")
+                    # Fall back to video only
+                    import shutil
+                    shutil.move(temp_video_path, str(filename))
+            else:
+                # No audio or ffmpeg not available, use video only
+                import shutil
+                shutil.move(temp_video_path, str(filename))
+            
+            # Clean up temporary files
+            try:
+                if os.path.exists(temp_video_path):
+                    os.unlink(temp_video_path)
+                for _, audio_path in temp_audio_files:
+                    if os.path.exists(audio_path):
+                        os.unlink(audio_path)
+            except:
+                pass
+            
+            # Save metadata
             with open(metadata_file, 'w') as f:
                 f.write(f"timestamp={readable_time}\n")
-                f.write(f"name=\n")  # Empty name initially
+                f.write(f"name=\n")
             
             self.signals.clip_saved.emit(str(filename))
             self.signals.status_update.emit(f"Clip saved: {filename.name}")
             
         except Exception as e:
             self.signals.error_occurred.emit(f"Error saving clip: {str(e)}")
+    
+    def _check_ffmpeg(self):
+        """Check if ffmpeg is available"""
+        try:
+            subprocess.run(['ffmpeg', '-version'], 
+                         stdout=subprocess.DEVNULL, 
+                         stderr=subprocess.DEVNULL)
+            return True
+        except FileNotFoundError:
+            return False
+    
+    def _merge_video_audio(self, video_path, audio_files, output_path):
+        """Merge video with audio tracks using ffmpeg"""
+        if not audio_files:
+            import shutil
+            shutil.move(video_path, output_path)
+            return
+        
+        # Build ffmpeg command
+        cmd = ['ffmpeg', '-y', '-i', video_path]
+        
+        # Add audio inputs
+        for _, audio_path in audio_files:
+            cmd.extend(['-i', audio_path])
+        
+        # Mix audio if multiple sources
+        if len(audio_files) > 1:
+            cmd.extend([
+                '-filter_complex', 
+                f'[1:a][2:a]amix=inputs={len(audio_files)}:duration=first[aout]',
+                '-map', '0:v',
+                '-map', '[aout]'
+            ])
+        else:
+            cmd.extend(['-map', '0:v', '-map', '1:a'])
+        
+        # Output settings
+        cmd.extend([
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-shortest',
+            output_path
+        ])
+        
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 class TrimDialog(QDialog):
     """Dialog for trimming video clips"""
@@ -277,19 +519,16 @@ class TrimDialog(QDialog):
         
         layout = QVBoxLayout()
         
-        # Video preview
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(640, 360)
         self.preview_label.setStyleSheet("background-color: black;")
         layout.addWidget(self.preview_label)
         
-        # Timeline info
         self.time_label = QLabel()
         self.update_time_label()
         layout.addWidget(self.time_label)
         
-        # Start trim slider
         start_layout = QHBoxLayout()
         start_layout.addWidget(QLabel("Start:"))
         self.start_slider = QSlider(Qt.Orientation.Horizontal)
@@ -302,7 +541,6 @@ class TrimDialog(QDialog):
         start_layout.addWidget(self.start_time_label)
         layout.addLayout(start_layout)
         
-        # End trim slider
         end_layout = QHBoxLayout()
         end_layout.addWidget(QLabel("End:"))
         self.end_slider = QSlider(Qt.Orientation.Horizontal)
@@ -315,7 +553,6 @@ class TrimDialog(QDialog):
         end_layout.addWidget(self.end_time_label)
         layout.addLayout(end_layout)
         
-        # Preview buttons
         preview_layout = QHBoxLayout()
         preview_start_btn = QPushButton("Preview Start")
         preview_start_btn.clicked.connect(lambda: self.show_frame(self.start_frame))
@@ -326,7 +563,6 @@ class TrimDialog(QDialog):
         preview_layout.addWidget(preview_end_btn)
         layout.addLayout(preview_layout)
         
-        # Dialog buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | 
             QDialogButtonBox.StandardButton.Cancel
@@ -336,12 +572,9 @@ class TrimDialog(QDialog):
         layout.addWidget(buttons)
         
         self.setLayout(layout)
-        
-        # Show first frame
         self.show_frame(0)
     
     def on_start_changed(self, value):
-        """Handle start slider change"""
         if value >= self.end_frame:
             value = self.end_frame - 1
             self.start_slider.setValue(value)
@@ -352,7 +585,6 @@ class TrimDialog(QDialog):
         self.show_frame(value)
     
     def on_end_changed(self, value):
-        """Handle end slider change"""
         if value <= self.start_frame:
             value = self.start_frame + 1
             self.end_slider.setValue(value)
@@ -363,25 +595,19 @@ class TrimDialog(QDialog):
         self.show_frame(value)
     
     def update_time_label(self):
-        """Update duration label"""
         duration = (self.end_frame - self.start_frame) / self.fps
         self.time_label.setText(f"Trimmed Duration: {duration:.1f}s")
     
     def show_frame(self, frame_num):
-        """Display specific frame"""
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
         ret, frame = self.cap.read()
         
         if ret:
-            # Convert BGR to RGB
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Convert to QImage
             h, w, ch = rgb_frame.shape
             bytes_per_line = ch * w
             q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             
-            # Scale to fit label
             pixmap = QPixmap.fromImage(q_img)
             scaled_pixmap = pixmap.scaled(self.preview_label.size(), 
                                           Qt.AspectRatioMode.KeepAspectRatio,
@@ -389,11 +615,9 @@ class TrimDialog(QDialog):
             self.preview_label.setPixmap(scaled_pixmap)
     
     def get_trim_range(self):
-        """Get selected trim range"""
         return self.start_frame, self.end_frame
     
     def closeEvent(self, event):
-        """Clean up on close"""
         if self.cap:
             self.cap.release()
         event.accept()
@@ -411,19 +635,16 @@ class ClipViewer(QWidget):
     def init_ui(self):
         layout = QVBoxLayout()
         
-        # Video display
         self.video_label = QLabel("No clip loaded")
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.video_label.setMinimumSize(640, 480)
         self.video_label.setStyleSheet("background-color: black; color: white;")
         layout.addWidget(self.video_label)
         
-        # Time label
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.time_label)
         
-        # Controls
         controls = QHBoxLayout()
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self.toggle_play)
@@ -437,7 +658,6 @@ class ClipViewer(QWidget):
         
         layout.addLayout(controls)
         
-        # Timer for playback
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.is_playing = False
@@ -445,7 +665,6 @@ class ClipViewer(QWidget):
         self.setLayout(layout)
     
     def release_current_clip(self):
-        """Release current video capture"""
         if self.is_playing:
             self.is_playing = False
             self.timer.stop()
@@ -455,11 +674,9 @@ class ClipViewer(QWidget):
             self.cap.release()
             self.cap = None
         
-        # Force Python to close the file handle
         import gc
         gc.collect()
         
-        # Clear display
         self.video_label.clear()
         self.video_label.setText("No clip loaded")
         self.time_label.setText("0:00 / 0:00")
@@ -470,8 +687,6 @@ class ClipViewer(QWidget):
         self.current_clip_path = None
     
     def load_clip(self, filepath):
-        """Load a video clip"""
-        # Release previous clip first
         self.release_current_clip()
         
         self.current_clip_path = filepath
@@ -481,16 +696,13 @@ class ClipViewer(QWidget):
             self.play_btn.setEnabled(True)
             self.position_slider.setEnabled(True)
             
-            # Set slider range
             total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.position_slider.setMaximum(total_frames - 1)
             
-            # Show first frame
             self.show_frame(0)
             self.update_time_display()
         
     def toggle_play(self):
-        """Play/pause video"""
         if not self.cap:
             return
         
@@ -505,7 +717,6 @@ class ClipViewer(QWidget):
             self.timer.stop()
     
     def update_frame(self):
-        """Update video frame during playback"""
         if not self.cap:
             return
         
@@ -517,7 +728,6 @@ class ClipViewer(QWidget):
             self.position_slider.setValue(current_pos)
             self.update_time_display()
         else:
-            # End of video
             self.is_playing = False
             self.play_btn.setText("Play")
             self.timer.stop()
@@ -525,7 +735,6 @@ class ClipViewer(QWidget):
             self.position_slider.setValue(0)
     
     def show_frame(self, frame_num):
-        """Show specific frame"""
         if not self.cap:
             return
         
@@ -536,21 +745,15 @@ class ClipViewer(QWidget):
             self.display_frame(frame)
     
     def seek(self, position):
-        """Seek to position"""
         self.show_frame(position)
         self.update_time_display()
     
     def display_frame(self, frame):
-        """Display frame in label"""
-        # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Convert to QImage
         h, w, ch = rgb_frame.shape
         bytes_per_line = ch * w
         q_img = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         
-        # Scale to fit label
         pixmap = QPixmap.fromImage(q_img)
         scaled_pixmap = pixmap.scaled(self.video_label.size(), 
                                       Qt.AspectRatioMode.KeepAspectRatio,
@@ -558,7 +761,6 @@ class ClipViewer(QWidget):
         self.video_label.setPixmap(scaled_pixmap)
     
     def update_time_display(self):
-        """Update time display"""
         if not self.cap:
             return
         
@@ -585,31 +787,64 @@ class MainWindow(QMainWindow):
         self.setup_signals()
         self.load_clips_list()
         
-        # Auto-start recording after checking permissions
-        QTimer.singleShot(500, self.auto_start_recording)
+        # Load audio devices
+        if AUDIO_AVAILABLE:
+            QTimer.singleShot(100, self.load_audio_devices)
         
-        # Auto-enable hotkey
+        QTimer.singleShot(500, self.auto_start_recording)
         QTimer.singleShot(1000, self.auto_enable_hotkey)
         
     def init_ui(self):
         self.setWindowTitle("Screen Clip Recorder")
-        self.setGeometry(100, 100, 1000, 700)
+        self.setGeometry(100, 100, 1000, 800)
         
-        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
         
-        # Main layout
         main_layout = QHBoxLayout()
         
-        # Left panel - Controls and clip list
+        # Left panel
         left_panel = QVBoxLayout()
         
         # Status
         self.status_label = QLabel("Status: Starting...")
         left_panel.addWidget(self.status_label)
         
-        # Buffer duration setting
+        # Audio settings group
+        if AUDIO_AVAILABLE:
+            audio_group = QGroupBox("Audio Settings")
+            audio_layout = QVBoxLayout()
+            
+            # Microphone
+            mic_layout = QHBoxLayout()
+            self.mic_checkbox = QCheckBox("Record Microphone")
+            self.mic_checkbox.stateChanged.connect(self.toggle_microphone)
+            mic_layout.addWidget(self.mic_checkbox)
+            audio_layout.addLayout(mic_layout)
+            
+            self.mic_combo = QComboBox()
+            self.mic_combo.currentIndexChanged.connect(self.on_mic_device_changed)
+            audio_layout.addWidget(self.mic_combo)
+            
+            # Desktop audio
+            desktop_layout = QHBoxLayout()
+            self.desktop_checkbox = QCheckBox("Record Desktop Audio")
+            self.desktop_checkbox.stateChanged.connect(self.toggle_desktop_audio)
+            desktop_layout.addWidget(self.desktop_checkbox)
+            audio_layout.addLayout(desktop_layout)
+            
+            self.desktop_combo = QComboBox()
+            self.desktop_combo.currentIndexChanged.connect(self.on_desktop_device_changed)
+            audio_layout.addWidget(self.desktop_combo)
+            
+            audio_group.setLayout(audio_layout)
+            left_panel.addWidget(audio_group)
+        else:
+            warning_label = QLabel("⚠️ Audio disabled: Install sounddevice and soundfile")
+            warning_label.setStyleSheet("color: orange;")
+            left_panel.addWidget(warning_label)
+        
+        # Buffer duration
         buffer_layout = QHBoxLayout()
         buffer_layout.addWidget(QLabel("Buffer (seconds):"))
         self.buffer_spin = QSpinBox()
@@ -637,7 +872,7 @@ class MainWindow(QMainWindow):
         self.clips_list.itemClicked.connect(self.on_clip_selected)
         left_panel.addWidget(self.clips_list)
         
-        # Clip action buttons
+        # Clip actions
         clip_actions = QHBoxLayout()
         
         self.trim_btn = QPushButton("Trim")
@@ -652,34 +887,168 @@ class MainWindow(QMainWindow):
         self.delete_btn.clicked.connect(self.delete_clip)
         clip_actions.addWidget(self.delete_btn)
         
-        self.upload_btn = QPushButton("Upload Clip")
+        self.upload_btn = QPushButton("Upload")
         self.upload_btn.clicked.connect(self.upload_clip)
         clip_actions.addWidget(self.upload_btn)
         
         left_panel.addLayout(clip_actions)
         
-        # Open folder button
         self.folder_btn = QPushButton("Open Clips Folder")
         self.folder_btn.clicked.connect(self.open_clips_folder)
         left_panel.addWidget(self.folder_btn)
         
         main_layout.addLayout(left_panel, 1)
         
-        # Right panel - Video viewer
+        # Right panel
         self.viewer = ClipViewer()
         main_layout.addWidget(self.viewer, 2)
         
         central.setLayout(main_layout)
     
+    def load_audio_devices(self):
+        """Load available audio devices"""
+        if not AUDIO_AVAILABLE or not self.recorder.audio_recorder:
+            return
+        
+        input_devices, output_devices = self.recorder.audio_recorder.get_audio_devices()
+        
+        # Populate microphone dropdown
+        self.mic_combo.clear()
+        for device in input_devices:
+            self.mic_combo.addItem(device['name'], device['index'])
+        
+        # Populate desktop audio dropdown
+        # On Windows, look for "Stereo Mix" or similar
+        # On Linux, look for "Monitor" devices
+        # On macOS, this requires additional setup
+        self.desktop_combo.clear()
+        
+        system = platform.system()
+        if system == "Windows":
+            # Look for stereo mix or loopback devices
+            for device in input_devices:
+                if 'stereo mix' in device['name'].lower() or 'wave out' in device['name'].lower():
+                    self.desktop_combo.addItem(device['name'], device['index'])
+        elif system == "Linux":
+            # Look for monitor devices
+            for device in input_devices:
+                if 'monitor' in device['name'].lower() or 'output' in device['name'].lower():
+                    self.desktop_combo.addItem(device['name'], device['index'])
+        elif system == "Darwin":
+            # macOS requires additional software like BlackHole
+            self.desktop_combo.addItem("(Requires BlackHole or similar)", -1)
+            for device in input_devices:
+                if 'blackhole' in device['name'].lower() or 'soundflower' in device['name'].lower():
+                    self.desktop_combo.addItem(device['name'], device['index'])
+        
+        if self.desktop_combo.count() == 0:
+            self.desktop_combo.addItem("No desktop audio device found", -1)
+            self.desktop_checkbox.setEnabled(False)
+    
+    def toggle_microphone(self, state):
+        """Toggle microphone recording"""
+        if not AUDIO_AVAILABLE or not self.recorder.audio_recorder:
+            return
+        
+        enabled = state == Qt.CheckState.Checked.value
+        self.recorder.audio_recorder.mic_enabled = enabled
+        
+        if enabled:
+            device_index = self.mic_combo.currentData()
+            if device_index is not None and device_index >= 0:
+                self.recorder.audio_recorder.mic_device = device_index
+                self.update_status("Microphone enabled")
+            else:
+                self.mic_checkbox.setChecked(False)
+                self.show_error("Please select a microphone device")
+        else:
+            self.update_status("Microphone disabled")
+        
+        # Restart recording if active
+        if self.recorder.is_recording:
+            self.recorder.audio_recorder.stop_recording()
+            self.recorder.audio_recorder.start_recording()
+    
+    def toggle_desktop_audio(self, state):
+        """Toggle desktop audio recording"""
+        if not AUDIO_AVAILABLE or not self.recorder.audio_recorder:
+            return
+        
+        enabled = state == Qt.CheckState.Checked.value
+        self.recorder.audio_recorder.desktop_enabled = enabled
+        
+        if enabled:
+            device_index = self.desktop_combo.currentData()
+            if device_index is not None and device_index >= 0:
+                self.recorder.audio_recorder.desktop_device = device_index
+                self.update_status("Desktop audio enabled")
+            else:
+                self.desktop_checkbox.setChecked(False)
+                
+                system = platform.system()
+                if system == "Windows":
+                    self.show_error(
+                        "Desktop audio requires enabling Stereo Mix:\n\n"
+                        "1. Right-click speaker icon in taskbar\n"
+                        "2. Select 'Sounds' → 'Recording' tab\n"
+                        "3. Right-click empty space → 'Show Disabled Devices'\n"
+                        "4. Enable 'Stereo Mix' or 'Wave Out Mix'\n"
+                        "5. Restart this application"
+                    )
+                elif system == "Linux":
+                    self.show_error(
+                        "Desktop audio requires PulseAudio monitor:\n\n"
+                        "Run: pactl load-module module-loopback\n"
+                        "Then restart this application"
+                    )
+                elif system == "Darwin":
+                    self.show_error(
+                        "Desktop audio on macOS requires BlackHole:\n\n"
+                        "1. Install BlackHole: brew install blackhole-2ch\n"
+                        "2. Configure Audio MIDI Setup to route audio\n"
+                        "3. Restart this application"
+                    )
+        else:
+            self.update_status("Desktop audio disabled")
+        
+        # Restart recording if active
+        if self.recorder.is_recording:
+            self.recorder.audio_recorder.stop_recording()
+            self.recorder.audio_recorder.start_recording()
+    
+    def on_mic_device_changed(self, index):
+        """Handle microphone device change"""
+        if not AUDIO_AVAILABLE or not self.recorder.audio_recorder:
+            return
+        
+        device_index = self.mic_combo.currentData()
+        if device_index is not None and device_index >= 0:
+            self.recorder.audio_recorder.mic_device = device_index
+            if self.mic_checkbox.isChecked():
+                if self.recorder.is_recording:
+                    self.recorder.audio_recorder.stop_recording()
+                    self.recorder.audio_recorder.start_recording()
+    
+    def on_desktop_device_changed(self, index):
+        """Handle desktop audio device change"""
+        if not AUDIO_AVAILABLE or not self.recorder.audio_recorder:
+            return
+        
+        device_index = self.desktop_combo.currentData()
+        if device_index is not None and device_index >= 0:
+            self.recorder.audio_recorder.desktop_device = device_index
+            if self.desktop_checkbox.isChecked():
+                if self.recorder.is_recording:
+                    self.recorder.audio_recorder.stop_recording()
+                    self.recorder.audio_recorder.start_recording()
+    
     def setup_signals(self):
-        """Connect recorder signals"""
         self.recorder.signals.clip_saved.connect(self.on_clip_saved)
         self.recorder.signals.status_update.connect(self.update_status)
         self.recorder.signals.error_occurred.connect(self.show_error)
         self.recorder.signals.permission_needed.connect(self.show_permission_dialog)
     
     def show_permission_dialog(self):
-        """Show macOS permission instructions"""
         msg = QMessageBox(self)
         msg.setWindowTitle("Screen Recording Permission Required")
         msg.setIcon(QMessageBox.Icon.Information)
@@ -690,8 +1059,7 @@ class MainWindow(QMainWindow):
             "1. Open <b>System Settings</b><br>"
             "2. Go to <b>Privacy & Security</b> → <b>Screen Recording</b><br>"
             "3. Enable permission for <b>Terminal</b> or <b>Python</b><br>"
-            "4. Restart this application<br><br>"
-            "The app will open System Settings for you when you click OK."
+            "4. Restart this application"
         )
         
         open_settings_btn = msg.addButton("Open System Settings", QMessageBox.ButtonRole.AcceptRole)
@@ -701,7 +1069,6 @@ class MainWindow(QMainWindow):
         
         if msg.clickedButton() == open_settings_btn:
             import subprocess
-            # Open System Settings to Privacy & Security > Screen Recording
             subprocess.run([
                 "open",
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
@@ -711,176 +1078,12 @@ class MainWindow(QMainWindow):
         self.start_btn.setText("Start Recording Buffer")
     
     def auto_start_recording(self):
-        """Auto-start recording on launch"""
         if not self.recorder.is_recording:
             success = self.recorder.start_recording()
             if success:
                 self.update_status("Recording buffer active (auto-started)")
     
-    def upload_clip(self):
-    """Upload selected clip to cloud server"""
-    current_item = self.clips_list.currentItem()
-    if not current_item:
-        QMessageBox.information(self, "No Clip Selected", 
-                            "Please select a clip to upload.")
-        return
-    
-    filename = current_item.data(Qt.ItemDataRole.UserRole)
-    clip_path = self.recorder.clips_dir / filename
-    
-    if not clip_path.exists():
-        self.show_error("Clip file does not exist.")
-        return
-    
-    # Check file size
-    file_size = clip_path.stat().st_size
-    file_size_mb = file_size / (1024 * 1024)
-    
-    # Get server URL from settings or use default
-    if not hasattr(self, 'server_url') or not self.server_url:
-        # Prompt for server URL on first upload
-        self.server_url = self.prompt_server_url()
-    
-    if not self.server_url:
-        return  # User cancelled
-    
-    # Check file size limit
-    if file_size_mb > 50:
-        self.show_error(
-            f"File too large ({file_size_mb:.1f}MB)\n\n"
-            "The server has a 50MB limit.\n"
-            "Please trim your clip to reduce file size."
-        )
-        return
-    
-    try:
-        self.update_status(f"Uploading clip ({file_size_mb:.1f}MB)...")
-        QApplication.processEvents()
-        
-        with open(clip_path, 'rb') as f:
-            files = {'file': (filename, f, 'video/mp4')}
-            
-            response = requests.post(
-                f'{self.server_url}/api/upload',
-                files=files,
-                timeout=300
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                if result.get('success'):
-                    clip_url = result['url']
-                    direct_url = result['direct_url']
-                    
-                    # Copy URL to clipboard
-                    QApplication.clipboard().setText(clip_url)
-                    
-                    self.update_status(f"Upload successful!")
-                    self.show_upload_success(clip_url, direct_url, filename)
-                else:
-                    self.show_error(f"Upload failed: {result.get('error', 'Unknown error')}")
-            else:
-                error_msg = "Unknown error"
-                try:
-                    error_data = response.json()
-                    error_msg = error_data.get('error', error_msg)
-                except:
-                    pass
-                
-                self.show_error(
-                    f"Upload failed: {error_msg}\n\n"
-                    f"Status code: {response.status_code}"
-                )
-                
-    except requests.exceptions.ConnectionError:
-        self.show_error(
-            f"Could not connect to server\n\n"
-            f"URL: {self.server_url}\n\n"
-            "Please check:\n"
-            "• Is the URL correct?\n"
-            "• Is the server running?\n"
-            "• Is your internet working?"
-        )
-        # Clear saved URL so user can try a different one
-        self.server_url = None
-        
-    except requests.exceptions.Timeout:
-        self.show_error(
-            "Upload timed out\n\n"
-            "This could be because:\n"
-            "• The file is very large\n"
-            "• Your internet is slow\n"
-            "• The server is not responding\n\n"
-            "Try trimming the clip to reduce file size."
-        )
-    except Exception as e:
-        self.show_error(f"Upload error: {str(e)}")
-
-def prompt_server_url(self):
-    """Prompt user for server URL"""
-    from PyQt6.QtWidgets import QInputDialog
-    
-    # Provide helpful default examples
-    default_url = "https://your-app.railway.app"
-    
-    dialog = QInputDialog(self)
-    dialog.setWindowTitle("Server URL")
-    dialog.setLabelText(
-        "Enter your Screen Clips server URL:\n\n"
-        "Examples:\n"
-        "• https://your-app.railway.app\n"
-        "• https://your-app.onrender.com\n"
-        "• https://your-app.fly.dev\n"
-        "• http://localhost:5000 (local testing)"
-    )
-    dialog.setTextValue(default_url)
-    dialog.resize(500, 200)
-    
-    if dialog.exec() == QInputDialog.DialogCode.Accepted:
-        url = dialog.textValue().strip().rstrip('/')
-        if url:
-            # Validate URL format
-            if not url.startswith('http://') and not url.startswith('https://'):
-                self.show_error("URL must start with http:// or https://")
-                return self.prompt_server_url()  # Try again
-            return url
-    
-    return None
-
-def show_upload_success(self, clip_url, direct_url, filename):
-    """Show upload success dialog"""
-    msg = QMessageBox(self)
-    msg.setWindowTitle("Upload Successful!")
-    msg.setIcon(QMessageBox.Icon.Information)
-    
-    message = f"""
-<b>✓ Clip uploaded successfully!</b><br><br>
-<b>File:</b> {filename}<br>
-<b>Watch URL:</b> <a href="{clip_url}">{clip_url}</a><br><br>
-<i>The URL has been copied to your clipboard.</i><br><br>
-Share this link with anyone to let them watch your clip!
-    """
-    
-    msg.setText(message)
-    msg.setTextFormat(Qt.TextFormat.RichText)
-    
-    open_btn = msg.addButton("Open in Browser", QMessageBox.ButtonRole.AcceptRole)
-    copy_btn = msg.addButton("Copy URL Again", QMessageBox.ButtonRole.ActionRole)
-    ok_btn = msg.addButton("OK", QMessageBox.ButtonRole.RejectRole)
-    
-    msg.exec()
-    
-    clicked = msg.clickedButton()
-    if clicked == open_btn:
-        import webbrowser
-        webbrowser.open(clip_url)
-    elif clicked == copy_btn:
-        QApplication.clipboard().setText(clip_url)
-        self.update_status("URL copied to clipboard")
-    
     def auto_enable_hotkey(self):
-        """Auto-enable hotkey on launch"""
         if not self.hotkey_registered:
             try:
                 keyboard.add_hotkey('f9', self.save_clip)
@@ -890,7 +1093,6 @@ Share this link with anyone to let them watch your clip!
                 self.show_error(f"Failed to register hotkey: {str(e)}")
     
     def toggle_recording(self):
-        """Start/stop recording buffer"""
         if not self.recorder.is_recording:
             self.recorder.buffer_seconds = self.buffer_spin.value()
             self.recorder.frame_buffer = deque(maxlen=self.recorder.buffer_seconds * self.recorder.fps)
@@ -903,13 +1105,11 @@ Share this link with anyone to let them watch your clip!
             self.save_btn.setEnabled(False)
     
     def save_clip(self):
-        """Save clip from buffer"""
         filename = self.recorder.save_clip()
         if filename:
             self.update_status("Saving clip...")
     
     def toggle_hotkey(self):
-        """Enable/disable F9 hotkey"""
         if not self.hotkey_registered:
             try:
                 keyboard.add_hotkey('f9', self.save_clip)
@@ -927,8 +1127,152 @@ Share this link with anyone to let them watch your clip!
             except:
                 pass
     
+    def upload_clip(self):
+        current_item = self.clips_list.currentItem()
+        if not current_item:
+            QMessageBox.information(self, "No Clip Selected", 
+                                "Please select a clip to upload.")
+            return
+        
+        filename = current_item.data(Qt.ItemDataRole.UserRole)
+        clip_path = self.recorder.clips_dir / filename
+        
+        if not clip_path.exists():
+            self.show_error("Clip file does not exist.")
+            return
+        
+        file_size = clip_path.stat().st_size
+        file_size_mb = file_size / (1024 * 1024)
+        
+        if not hasattr(self, 'server_url') or not self.server_url:
+            self.server_url = self.prompt_server_url()
+        
+        if not self.server_url:
+            return
+        
+        if file_size_mb > 50:
+            self.show_error(
+                f"File too large ({file_size_mb:.1f}MB)\n\n"
+                "The server has a 50MB limit.\n"
+                "Please trim your clip to reduce file size."
+            )
+            return
+        
+        try:
+            self.update_status(f"Uploading clip ({file_size_mb:.1f}MB)...")
+            QApplication.processEvents()
+            
+            with open(clip_path, 'rb') as f:
+                files = {'file': (filename, f, 'video/mp4')}
+                
+                response = requests.post(
+                    f'{self.server_url}/api/upload',
+                    files=files,
+                    timeout=300
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    if result.get('success'):
+                        clip_url = result['url']
+                        direct_url = result['direct_url']
+                        
+                        QApplication.clipboard().setText(clip_url)
+                        
+                        self.update_status(f"Upload successful!")
+                        self.show_upload_success(clip_url, direct_url, filename)
+                    else:
+                        self.show_error(f"Upload failed: {result.get('error', 'Unknown error')}")
+                else:
+                    error_msg = "Unknown error"
+                    try:
+                        error_data = response.json()
+                        error_msg = error_data.get('error', error_msg)
+                    except:
+                        pass
+                    
+                    self.show_error(
+                        f"Upload failed: {error_msg}\n\n"
+                        f"Status code: {response.status_code}"
+                    )
+                    
+        except requests.exceptions.ConnectionError:
+            self.show_error(
+                f"Could not connect to server\n\n"
+                f"URL: {self.server_url}\n\n"
+                "Please check:\n"
+                "• Is the URL correct?\n"
+                "• Is the server running?\n"
+                "• Is your internet working?"
+            )
+            self.server_url = None
+            
+        except requests.exceptions.Timeout:
+            self.show_error(
+                "Upload timed out\n\n"
+                "This could be because:\n"
+                "• The file is very large\n"
+                "• Your internet is slow\n"
+                "• The server is not responding\n\n"
+                "Try trimming the clip to reduce file size."
+            )
+        except Exception as e:
+            self.show_error(f"Upload error: {str(e)}")
+    
+    def prompt_server_url(self):
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Server URL")
+        dialog.setLabelText(
+            "Enter your Screen Clips server URL:\n\n"
+            "Examples:\n"
+            "• https://your-app.railway.app\n"
+            "• https://your-app.onrender.com\n"
+            "• http://localhost:5000"
+        )
+        dialog.setTextValue("https://your-app.railway.app")
+        dialog.resize(500, 200)
+        
+        if dialog.exec() == QInputDialog.DialogCode.Accepted:
+            url = dialog.textValue().strip().rstrip('/')
+            if url:
+                if not url.startswith('http://') and not url.startswith('https://'):
+                    self.show_error("URL must start with http:// or https://")
+                    return self.prompt_server_url()
+                return url
+        
+        return None
+    
+    def show_upload_success(self, clip_url, direct_url, filename):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Upload Successful!")
+        msg.setIcon(QMessageBox.Icon.Information)
+        
+        message = f"""
+<b>✓ Clip uploaded successfully!</b><br><br>
+<b>File:</b> {filename}<br>
+<b>Watch URL:</b> <a href="{clip_url}">{clip_url}</a><br><br>
+<i>The URL has been copied to your clipboard.</i>
+        """
+        
+        msg.setText(message)
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        
+        open_btn = msg.addButton("Open in Browser", QMessageBox.ButtonRole.AcceptRole)
+        copy_btn = msg.addButton("Copy URL Again", QMessageBox.ButtonRole.ActionRole)
+        ok_btn = msg.addButton("OK", QMessageBox.ButtonRole.RejectRole)
+        
+        msg.exec()
+        
+        clicked = msg.clickedButton()
+        if clicked == open_btn:
+            import webbrowser
+            webbrowser.open(clip_url)
+        elif clicked == copy_btn:
+            QApplication.clipboard().setText(clip_url)
+            self.update_status("URL copied to clipboard")
+    
     def rename_clip(self):
-        """Rename selected clip"""
         current_item = self.clips_list.currentItem()
         if not current_item:
             QMessageBox.information(self, "No Clip Selected", 
@@ -992,7 +1336,6 @@ Share this link with anyone to let them watch your clip!
                 self.show_error(f"Failed to rename clip: {str(e)}")
     
     def trim_clip(self):
-        """Open trim dialog for selected clip"""
         current_item = self.clips_list.currentItem()
         if not current_item:
             QMessageBox.information(self, "No Clip Selected", 
@@ -1012,7 +1355,6 @@ Share this link with anyone to let them watch your clip!
             self.create_trimmed_video(str(clip_path), start_frame, end_frame)
     
     def create_trimmed_video(self, source_path, start_frame, end_frame):
-        """Create a new trimmed video"""
         try:
             self.update_status("Creating trimmed clip...")
             
@@ -1044,7 +1386,7 @@ Share this link with anyone to let them watch your clip!
                 f.write(f"timestamp={readable_time}\n")
                 f.write(f"name=(Trimmed)\n")
             
-            self.update_status(f"Trimmed clip saved: {output_path.name}")
+            self.update_status(f"Trimmed clip saved")
             self.load_clips_list()
             
             for i in range(self.clips_list.count()):
@@ -1058,7 +1400,6 @@ Share this link with anyone to let them watch your clip!
             self.show_error(f"Failed to trim clip: {str(e)}")
     
     def load_clips_list(self):
-        """Load list of saved clips with custom names"""
         self.clips_list.clear()
         clips = sorted(self.recorder.clips_dir.glob("*.mp4"), reverse=True)
         
@@ -1092,17 +1433,14 @@ Share this link with anyone to let them watch your clip!
             self.clips_list.addItem(item)
     
     def on_clip_selected(self, item):
-        """Handle clip selection"""
         filename = item.data(Qt.ItemDataRole.UserRole)
         clip_path = self.recorder.clips_dir / filename
         self.viewer.load_clip(str(clip_path))
     
     def on_clip_saved(self, filename):
-        """Handle new clip saved"""
         self.load_clips_list()
     
     def delete_clip(self):
-        """Delete selected clip"""
         current_item = self.clips_list.currentItem()
         if not current_item:
             return
@@ -1146,15 +1484,13 @@ Share this link with anyone to let them watch your clip!
                         continue
                     else:
                         self.show_error(f"Failed to delete after {max_attempts} attempts.\n\n"
-                                      f"The file is still being used by another process.\n"
-                                      f"Please close any video players or file explorers viewing this file.\n\n"
-                                      f"Error: {str(e)}")
+                                      f"The file is still being used.\n"
+                                      f"Close any video players viewing this file.")
                 except Exception as e:
                     self.show_error(f"Failed to delete: {str(e)}")
                     return
     
     def open_clips_folder(self):
-        """Open clips folder in file explorer"""
         import subprocess
         import platform
         
@@ -1168,15 +1504,12 @@ Share this link with anyone to let them watch your clip!
             subprocess.run(["xdg-open", folder])
     
     def update_status(self, message):
-        """Update status label"""
         self.status_label.setText(f"Status: {message}")
     
     def show_error(self, message):
-        """Show error message"""
         QMessageBox.critical(self, "Error", message)
     
     def closeEvent(self, event):
-        """Clean up on close"""
         self.viewer.release_current_clip()
         self.recorder.stop_recording()
         
@@ -1196,4 +1529,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
