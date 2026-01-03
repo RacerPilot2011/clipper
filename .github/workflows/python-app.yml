@@ -9,8 +9,26 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        include:
+          # Apple Silicon (M1/M2/M3)
+          - os: macos-latest
+            architecture: arm64
+            artifact_suffix: macOS-ARM64
+          # Intel Mac
+          - os: macos-15-intel
+            architecture: x86_64
+            artifact_suffix: macOS-Intel
+          # Windows
+          - os: windows-latest
+            architecture: x64
+            artifact_suffix: Windows
+          # Linux
+          - os: ubuntu-latest
+            architecture: x64
+            artifact_suffix: Linux
+
     runs-on: ${{ matrix.os }}
+    
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -18,7 +36,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13" # Downgraded from 3.14 to ensure PyInstaller support
+          python-version: "3.13" # Keep 3.13 for stability
+          # This ensures we get the correct python arch for the runner (ARM vs Intel)
+          architecture: ${{ matrix.architecture }}
 
       - name: Install dependencies
         run: |
@@ -26,32 +46,31 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # --- Build Step for Mac (Both Intel and ARM) ---
       - name: Build app (macOS)
         if: runner.os == 'macOS'
         run: |
           pyinstaller --clean --windowed --name Clipper main.py
 
-      - name: Build app (Windows)
-        if: runner.os == 'Windows'
+      # --- Build Step for Windows/Linux ---
+      - name: Build app (Windows/Linux)
+        if: runner.os != 'macOS'
         run: |
           pyinstaller --clean --onefile --name Clipper main.py
 
-      - name: Build app (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          pyinstaller --clean --onefile --name Clipper main.py
-
-      # This step simplifies uploading by zipping the macOS app bundle first
-      - name: Zip macOS App (macOS only)
+      # --- Packaging for Mac ---
+      - name: Zip macOS App
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -r Clipper-macOS.zip Clipper.app
+          # Name the zip explicitly so you know which is which
+          zip -r Clipper-${{ matrix.artifact_suffix }}.zip Clipper.app
 
+      # --- Uploading ---
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Clipper-${{ runner.os }}
+          name: Clipper-${{ matrix.artifact_suffix }}
           path: |
             dist/*.exe
             dist/*.zip
