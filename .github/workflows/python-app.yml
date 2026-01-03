@@ -16,7 +16,7 @@ jobs:
             artifact_suffix: macOS-ARM64
           # Intel Mac
           - os: macos-15-intel
-            architecture: x86_64
+            architecture: x64
             artifact_suffix: macOS-Intel
           # Windows
           - os: windows-latest
