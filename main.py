@@ -902,7 +902,7 @@ class MainWindow(QMainWindow):
         buffer_layout = QHBoxLayout()
         buffer_layout.addWidget(QLabel("Buffer (seconds):"))
         self.buffer_spin = QSpinBox()
-        self.buffer_spin.setRange(5, 120)
+        self.buffer_spin.setRange(5, 480)
         self.buffer_spin.setValue(30)
         buffer_layout.addWidget(self.buffer_spin)
         left_panel.addLayout(buffer_layout)
