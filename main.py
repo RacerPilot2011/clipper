@@ -124,24 +124,38 @@ class ScreenRecorder:
                 time.sleep(sleep_time)
     
     def _audio_loop(self):
-        """Continuously capture audio to buffer"""
-        chunk_samples = int(self.sample_rate * self.audio_chunk_duration)
-        
-        def audio_callback(indata, frames, time_info, status):
+        device_index = self.audio_combo.currentData()
+        device_info = sd.query_devices(device_index)
+
+        channels = min(2, device_info["max_input_channels"])
+        samplerate = int(device_info["default_samplerate"])
+        chunk_samples = int(samplerate * self.audio_chunk_duration)
+
+        def callback(indata, frames, time_info, status):
             if status:
-                print(f"Audio status: {status}")
-            # Store audio chunk
+                print(status)
             self.audio_buffer.append(indata.copy())
-        
+
+        extra = None
+        if platform.system() == "Windows":
+            extra = sd.WasapiSettings(loopback="loopback" in device_info["name"].lower())
+
         try:
-            with sd.InputStream(samplerate=self.sample_rate, 
-                              channels=2,
-                              callback=audio_callback,
-                              blocksize=chunk_samples):
+            with sd.InputStream(
+                device=device_index,
+                samplerate=samplerate,
+                channels=channels,
+                callback=callback,
+                blocksize=chunk_samples,
+                dtype="float32",
+                extra_settings=extra
+            ):
                 while self.is_recording:
                     time.sleep(0.1)
         except Exception as e:
-            print(f"Audio recording error: {e}")
+            self.signals.error_occurred.emit(f"Audio error: {e}")
+
+
     
     def save_clip(self, duration_seconds=None):
         """Save the last N seconds from buffer with audio"""
@@ -243,6 +257,8 @@ class ScreenRecorder:
                 '-i', temp_video.name,
                 '-i', temp_audio.name,
                 '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-tune', 'zerolatency',
                 '-c:a', 'aac',
                 '-shortest',
                 str(filename)
@@ -591,12 +607,74 @@ class MainWindow(QMainWindow):
         if not self.username:
             QTimer.singleShot(0, self.prompt_for_username)
         self.init_ui()
+        self.macos_permission_check()
         self.setup_signals()
         self.load_clips_list()
+        self.check_blackhole()
         
         QTimer.singleShot(500, self.auto_start_recording)
         QTimer.singleShot(1000, self.auto_enable_hotkey)
+
     
+
+    def macos_permission_check(self):
+        if platform.system() != "Darwin":
+            return
+
+        marker = Path.home() / "ScreenClips" / ".mac_permissions_shown"
+        if marker.exists():
+            return
+
+        msg = (
+            "macOS requires permissions for this app to work correctly.\n\n"
+            "Please grant the following:\n\n"
+            "• Screen Recording – required to capture your screen\n"
+            "• Microphone – required to record audio\n"
+            "• Accessibility – required for global hotkeys\n\n"
+            "Desktop audio on macOS requires a virtual device (BlackHole).\n\n"
+            "Click OK to open System Settings."
+        )
+
+        reply = QMessageBox.information(
+            self,
+            "macOS Permissions Required",
+            msg,
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+        )
+
+        if reply == QMessageBox.StandardButton.Ok:
+            self.open_macos_permissions()
+
+        marker.parent.mkdir(exist_ok=True)
+        marker.write_text("shown")
+    def open_macos_permissions(self):
+            try:
+                subprocess.run([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy"
+                ])
+            except:
+                pass
+    def check_blackhole(self):
+        if platform.system() != "Darwin":
+            return
+
+        devices = sd.query_devices()
+        for dev in devices:
+            if "blackhole" in dev["name"].lower():
+                return
+
+        QMessageBox.warning(
+            self,
+            "Desktop Audio on macOS",
+            "To record desktop audio on macOS, install BlackHole:\n\n"
+            "1. Download BlackHole 2ch\n"
+            "2. Open Audio MIDI Setup\n"
+            "3. Set system output to BlackHole\n"
+            "4. Select BlackHole in Audio Input\n\n"
+            "https://existential.audio/blackhole/"
+        )
+
     def load_username(self):
         username_file = Path.home() / "ScreenClips" / ".username"
         if username_file.exists():
@@ -644,15 +722,50 @@ class MainWindow(QMainWindow):
         
         self.status_label = QLabel("Status: Starting...")
         left_panel.addWidget(self.status_label)
+
+        #Microphone
+        left_panel.addWidget(QLabel("Audio Input:"))
+
+        self.audio_combo = QComboBox()
+        self.populate_audio_devices()
+        left_panel.addWidget(self.audio_combo)
         
         # Buffer duration
-        buffer_layout = QHBoxLayout()
-        buffer_layout.addWidget(QLabel("Buffer (seconds):"))
-        self.buffer_spin = QSpinBox()
-        self.buffer_spin.setRange(5, 120)
-        self.buffer_spin.setValue(30)
-        buffer_layout.addWidget(self.buffer_spin)
-        left_panel.addLayout(buffer_layout)
+        left_panel.addWidget(QLabel("Replay Buffer:"))
+
+        self.buffer_preset = QComboBox()
+        self.buffer_preset.addItems([
+            "15 seconds",
+            "30 seconds",
+            "1 minute",
+            "2 minutes",
+            "5 minutes",
+            "Custom"
+        ])
+        self.buffer_preset.setCurrentText("30 seconds")
+        self.buffer_preset.currentTextChanged.connect(self.on_buffer_preset_changed)
+        left_panel.addWidget(self.buffer_preset)
+
+        self.custom_buffer_widget = QWidget()
+        custom_layout = QHBoxLayout()
+
+        custom_layout.addWidget(QLabel("Minutes:"))
+        self.custom_minutes = QSpinBox()
+        self.custom_minutes.setRange(0, 10)
+        self.custom_minutes.setValue(0)
+        custom_layout.addWidget(self.custom_minutes)
+
+        custom_layout.addWidget(QLabel("Seconds:"))
+        self.custom_seconds = QSpinBox()
+        self.custom_seconds.setRange(0, 59)
+        self.custom_seconds.setValue(30)
+        custom_layout.addWidget(self.custom_seconds)
+
+        custom_layout.setContentsMargins(0, 0, 0, 0)
+        self.custom_buffer_widget.setLayout(custom_layout)
+        self.custom_buffer_widget.setVisible(False)
+
+        left_panel.addWidget(self.custom_buffer_widget)
         
         # Control buttons
         self.start_btn = QPushButton("⏹️ Stop Recording")
@@ -666,6 +779,16 @@ class MainWindow(QMainWindow):
         self.hotkey_btn = QPushButton("⌨️ Hotkey: Enabled (F9)")
         self.hotkey_btn.clicked.connect(self.toggle_hotkey)
         left_panel.addWidget(self.hotkey_btn)
+
+        left_panel.addWidget(QLabel("Save Clip Hotkey:"))
+
+        self.hotkey_input = QLineEdit("F9")
+        left_panel.addWidget(self.hotkey_input)
+
+        self.set_hotkey_btn = QPushButton("Apply Hotkey")
+        self.set_hotkey_btn.clicked.connect(self.apply_hotkey)
+        left_panel.addWidget(self.set_hotkey_btn)
+
 
         self.upload_btn = QPushButton("☁️ Upload Selected Clip")
         self.upload_btn.clicked.connect(self.on_upload_clicked)
@@ -707,6 +830,34 @@ class MainWindow(QMainWindow):
         
         central.setLayout(main_layout)
     
+    def populate_audio_devices(self):
+        self.audio_combo.clear()
+        devices = sd.query_devices()
+
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0:
+                label = f"{dev['name']} ({i})"
+                self.audio_combo.addItem(label, i)
+
+    def apply_hotkey(self):
+        try:
+            keyboard.unhook_all()
+            hotkey = self.hotkey_input.text().strip().lower()
+            keyboard.add_hotkey(hotkey, self.save_clip)
+            self.hotkey_registered = True
+            self.update_status(f"Hotkey set to {hotkey.upper()}")
+        except Exception as e:
+            if platform.system() == "Darwin":
+                QMessageBox.warning(
+                    self,
+                    "Accessibility Permission Required",
+                    "Global hotkeys require Accessibility permission.\n\n"
+                    "System Settings → Privacy & Security → Accessibility\n"
+                    "Add and enable this app."
+                )
+            else:
+                self.show_error(f"Hotkey error: {e}")
+
     def setup_signals(self):
         self.recorder.signals.clip_saved.connect(self.on_clip_saved)
         self.recorder.signals.status_update.connect(self.update_status)
@@ -728,7 +879,7 @@ class MainWindow(QMainWindow):
     
     def toggle_recording(self):
         if not self.recorder.is_recording:
-            self.recorder.buffer_seconds = self.buffer_spin.value()
+            self.recorder.buffer_seconds = self.get_buffer_seconds()
             self.recorder.frame_buffer = deque(maxlen=self.recorder.buffer_seconds * self.recorder.fps)
             self.recorder.start_recording()
             self.start_btn.setText("Stop Recording Buffer")
