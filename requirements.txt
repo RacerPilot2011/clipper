@@ -1,9 +1,0 @@
-requests 
-PyQt6>=6.4.0
-opencv-python>=4.7.0
-mss>=9.0.1
-keyboard>=0.13.5
-numpy>=1.24.0
-pyperclip>=1.8.2
-sounddevice
-soundfile
