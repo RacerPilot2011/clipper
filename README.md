@@ -180,17 +180,6 @@ make -j$(nproc)
           └──────────────┘
 ```
 
-### Windows WASAPI Loopback Explained
-
-Traditional Python approaches require "Stereo Mix" (often disabled) or virtual cables. This C++ implementation uses **WASAPI loopback mode**:
-
-1. Opens the actual speakers/headphones device
-2. Sets `AUDCLNT_STREAMFLAGS_LOOPBACK` flag
-3. Captures the mixed audio stream before it hits the hardware
-4. Works with ANY output device, no configuration needed
-
-This is the same technique used by professional tools like OBS Studio and ShareX.
-
 ### Performance
 
 - **Screen Capture**: 
@@ -252,3 +241,4 @@ Contributions welcome! Please:
 - [ ] Plugin system for effects
 
 - [ ] Timeline editor for multi-clip editing
+
