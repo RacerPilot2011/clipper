@@ -1,4 +1,4 @@
-# Screen Clip Recorder - C++ Cross-Platform Edition
+# Screen Clip Recorder
 
 A high-performance screen recorder with instant replay functionality.
 
@@ -250,4 +250,5 @@ Contributions welcome! Please:
 - [ ] Webcam overlay
 - [ ] Live streaming support
 - [ ] Plugin system for effects
+
 - [ ] Timeline editor for multi-clip editing
