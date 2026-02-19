@@ -1,11 +1,24 @@
+/*
+ * AudioCapture.cpp
+ *
+ * Platform abstraction for capturing audio streams. The class supports
+ * two logical device types: Microphone (capture input) and DesktopAudio
+ * (system playback / loopback). The implementation delegates to a
+ * platform-specific backend (WASAPI on Windows, AudioQueue on macOS,
+ * PulseAudio on Linux).
+ *
+ * Important behavior:
+ * - The object is a `QThread`. The `run()` method performs initialization
+ *   and enters the capture loop. The capture loop appends `AudioSample`
+ *   chunks to `m_buffer` while respecting a time-bound buffer limit.
+ * - Public methods are safe to call from the GUI thread. Use signals to
+ *   observe start/stop and error conditions.
+ */
+
 #include "AudioCapture.h"
 #include <QDebug>
 #include <QDateTime>
 #include <cstring>
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 
 #ifdef _WIN32
 #include <comdef.h>
@@ -28,15 +41,13 @@ AudioCapture::AudioCapture(DeviceType type, QObject *parent)
     , m_audioClient(nullptr)
     , m_captureClient(nullptr)
     , m_waveFormat(nullptr)
+    , m_comInitialized(false)
 #elif __APPLE__
     , m_audioQueue(nullptr)
 #else
     , m_pulseAudio(nullptr)
 #endif
 {
-#ifdef _WIN32
-    CoInitialize(nullptr);
-#endif
 }
 
 AudioCapture::~AudioCapture() {
@@ -44,7 +55,6 @@ AudioCapture::~AudioCapture() {
     
 #ifdef _WIN32
     cleanupWASAPI();
-    CoUninitialize();
 #elif __APPLE__
     cleanupCoreAudio();
 #else
@@ -56,8 +66,12 @@ QStringList AudioCapture::getAvailableDevices(DeviceType type) {
     QStringList devices;
     
 #ifdef _WIN32
-    // Windows WASAPI enumeration
-    CoInitialize(nullptr);
+    // COM must be initialized on the calling thread before making any COM calls.
+    // We use COINIT_APARTMENTTHREADED since this is an enumeration on a temporary context
+    // that won't be accessed from other threads. Track whether we initialized COM so
+    // we can balance the CoUninitialize call later.
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool needsUninit = SUCCEEDED(hrInit);
     
     IMMDeviceEnumerator* enumerator = nullptr;
     HRESULT hr = CoCreateInstance(
@@ -78,6 +92,8 @@ QStringList AudioCapture::getAvailableDevices(DeviceType type) {
             UINT count;
             collection->GetCount(&count);
             
+            qDebug() << "Found" << count << (type == Microphone ? "microphone" : "desktop audio") << "devices";
+            
             for (UINT i = 0; i < count; i++) {
                 IMMDevice* device = nullptr;
                 if (SUCCEEDED(collection->Item(i, &device))) {
@@ -94,10 +110,12 @@ QStringList AudioCapture::getAvailableDevices(DeviceType type) {
                             QString id = QString::fromWCharArray(deviceId);
                             
                             if (type == DesktopAudio) {
-                                devices.append(name + " (WASAPI Loopback)|" + id);
+                                devices.append(name + " (Loopback)|" + id);
                             } else {
                                 devices.append(name + "|" + id);
                             }
+                            
+                            qDebug() << "  Device" << i << ":" << name;
                         }
                         
                         PropVariantClear(&varName);
@@ -111,9 +129,13 @@ QStringList AudioCapture::getAvailableDevices(DeviceType type) {
             collection->Release();
         }
         enumerator->Release();
+    } else {
+        qDebug() << "Failed to create device enumerator:" << QString::number(hr, 16);
     }
     
-    CoUninitialize();
+    if (needsUninit) {
+        CoUninitialize();
+    }
     
 #elif __APPLE__
     // macOS CoreAudio enumeration
@@ -133,49 +155,34 @@ QStringList AudioCapture::getAvailableDevices(DeviceType type) {
     
     for (UInt32 i = 0; i < deviceCount; i++) {
         AudioDeviceID deviceID = audioDevices[i];
-        
-        // Get device name
         CFStringRef deviceName = nullptr;
         dataSize = sizeof(deviceName);
         propertyAddress.mSelector = kAudioDevicePropertyDeviceNameCFString;
         propertyAddress.mScope = kAudioObjectPropertyScopeGlobal;
-        
         AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nullptr, &dataSize, &deviceName);
-        
         if (deviceName) {
             QString name = QString::fromCFString(deviceName);
-            
-            // Check if device has input or output capabilities
             propertyAddress.mSelector = kAudioDevicePropertyStreamConfiguration;
-            
             if (type == Microphone) {
                 propertyAddress.mScope = kAudioDevicePropertyScopeInput;
             } else {
                 propertyAddress.mScope = kAudioDevicePropertyScopeOutput;
             }
-            
             AudioObjectGetPropertyDataSize(deviceID, &propertyAddress, 0, nullptr, &dataSize);
-            
             if (dataSize > 0) {
                 AudioBufferList* bufferList = (AudioBufferList*)malloc(dataSize);
                 AudioObjectGetPropertyData(deviceID, &propertyAddress, 0, nullptr, &dataSize, bufferList);
-                
                 if (bufferList->mNumberBuffers > 0) {
                     devices.append(name + "|" + QString::number(deviceID));
                 }
-                
                 free(bufferList);
             }
-            
             CFRelease(deviceName);
         }
     }
-    
     delete[] audioDevices;
-    
 #else
     // Linux PulseAudio enumeration
-    // Note: This is simplified - full implementation would use pa_context
     devices.append("Default|default");
 #endif
     
@@ -187,280 +194,417 @@ bool AudioCapture::setDevice(const QString& deviceId) {
         emit errorOccurred("Cannot change device while capturing");
         return false;
     }
-    
     m_deviceId = deviceId;
+    qDebug() << "Audio device set to:" << deviceId;
     return true;
 }
 
 void AudioCapture::startCapture() {
     if (m_capturing.load()) {
+        qDebug() << "Already capturing";
         return;
     }
-    
     if (m_deviceId.isEmpty()) {
         emit errorOccurred("No device selected");
         return;
     }
     
+    qDebug() << "Starting audio capture for device:" << m_deviceId;
     m_stopRequested = false;
     start();
 }
 
 void AudioCapture::stopCapture() {
+    if (!isRunning()) {
+        qDebug() << "Capture thread not running";
+        return;
+    }
+    
+    qDebug() << "Stopping audio capture...";
     m_stopRequested = true;
-    wait(5000);
+
+    // Wait for the capture thread to finish cleanly. We give it 30 seconds to
+    // shut down gracefully. If it doesn't respond, force termination as a last resort
+    // (though this can leave platform resources in an inconsistent state).
+    if (!wait(30000)) {
+        qDebug() << "Warning: Audio capture thread did not stop gracefully, forcing termination";
+        terminate();
+        wait();
+    }
+    qDebug() << "Audio capture stopped";
 }
 
 std::vector<AudioSample> AudioCapture::getBuffer(int seconds) {
     QMutexLocker locker(&m_bufferMutex);
     
-    int samplesToGet = seconds * 2; // Assuming 0.5s chunks
-    std::vector<AudioSample> result;
+    qDebug() << "Getting audio buffer for" << seconds << "seconds";
+    qDebug() << "  Current buffer size:" << m_buffer.size() << "chunks";
     
-    int startIdx = (std::max)(0, (int)m_buffer.size() - samplesToGet);
-    for (size_t i = startIdx; i < m_buffer.size(); i++) {
-        result.push_back(m_buffer[i]);
+    std::vector<AudioSample> result;
+    if (m_buffer.empty()) {
+        qDebug() << "  Buffer is empty!";
+        return result;
     }
+
+    // Iterate the buffer in reverse and collect chunks until we have at least
+    // `seconds` duration of audio. We start from the back to get the most recent audio.
+    double collected = 0;
+    for (auto it = m_buffer.rbegin(); it != m_buffer.rend(); ++it) {
+        if (it->channels > 0 && it->sampleRate > 0) {
+            double chunkDuration = it->data.size() / (double)(it->channels * it->sampleRate);
+            result.insert(result.begin(), *it);
+            collected += chunkDuration;
+            if (collected >= seconds) {
+                break;
+            }
+        }
+    }
+    
+    qDebug() << "  Retrieved" << result.size() << "chunks (" << collected << "seconds)";
     
     return result;
 }
 
 void AudioCapture::clearBuffer() {
     QMutexLocker locker(&m_bufferMutex);
+    qDebug() << "Clearing audio buffer (" << m_buffer.size() << "chunks)";
     m_buffer.clear();
 }
 
 void AudioCapture::run() {
+    qDebug() << "=== Audio capture thread started ===";
+    qDebug() << "Device type:" << (m_deviceType == Microphone ? "Microphone" : "Desktop Audio");
+    
 #ifdef _WIN32
+    // On Windows, each thread must initialize COM independently. We use MULTITHREADED
+    // mode since this worker thread may be accessed by multiple components and we want
+    // maximum compatibility with COM apartment threading models.
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) {
+        qDebug() << "Failed to initialize COM library:" << QString::number(hr, 16);
+        emit errorOccurred("Failed to initialize COM library");
+        return;
+    }
+    m_comInitialized = true;
+    qDebug() << "COM initialized successfully";
+
     if (!initWASAPI()) {
+        qDebug() << "WASAPI initialization failed";
+        cleanupWASAPI();
+        CoUninitialize();
+        m_comInitialized = false;
         return;
     }
     
     m_capturing = true;
     emit captureStarted();
+    qDebug() << "Audio capture started successfully";
     
     captureWASAPI();
     
+    qDebug() << "Audio capture finished, cleaning up...";
     cleanupWASAPI();
+    CoUninitialize();
+    m_comInitialized = false;
     
 #elif __APPLE__
     if (!initCoreAudio()) {
         return;
     }
-    
     m_capturing = true;
     emit captureStarted();
-    
-    // CoreAudio uses callbacks, so just wait
     while (!m_stopRequested.load()) {
         msleep(100);
     }
-    
     cleanupCoreAudio();
-    
 #else
     if (!initPulseAudio()) {
         return;
     }
-    
     m_capturing = true;
     emit captureStarted();
-    
     capturePulseAudio();
-    
     cleanupPulseAudio();
 #endif
     
     m_capturing = false;
     emit captureStopped();
+    qDebug() << "=== Audio capture thread stopped ===";
 }
 
 #ifdef _WIN32
-
 bool AudioCapture::initWASAPI() {
-    HRESULT hr;
+    qDebug() << "[WASAPI Init] Starting initialization...";
     
-    // Create device enumerator
+    HRESULT hr;
     hr = CoCreateInstance(
         CLSID_MMDeviceEnumerator, nullptr,
         CLSCTX_ALL, IID_IMMDeviceEnumerator,
         (void**)&m_deviceEnumerator);
     
     if (FAILED(hr)) {
+        qDebug() << "[WASAPI Init] Failed to create device enumerator:" << QString::number(hr, 16);
         emit errorOccurred("Failed to create device enumerator");
         return false;
     }
+    qDebug() << "[WASAPI Init] Device enumerator created";
     
-    // Get device
-    LPWSTR deviceIdW = (LPWSTR)m_deviceId.split('|').last().toStdWString().c_str();
-    hr = m_deviceEnumerator->GetDevice(deviceIdW, &m_device);
+    QString deviceIdOnly = m_deviceId.split('|').last();
+    qDebug() << "[WASAPI Init] Getting device:" << deviceIdOnly;
     
+    std::wstring deviceIdW = deviceIdOnly.toStdWString();
+    hr = m_deviceEnumerator->GetDevice(deviceIdW.c_str(), &m_device);
     if (FAILED(hr)) {
+        qDebug() << "[WASAPI Init] Failed to get device:" << QString::number(hr, 16);
         emit errorOccurred("Failed to get device");
         return false;
     }
+    qDebug() << "[WASAPI Init] Device obtained";
     
-    // Activate audio client
-    hr = m_device->Activate(
-        IID_IAudioClient, CLSCTX_ALL,
-        nullptr, (void**)&m_audioClient);
-    
+    hr = m_device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&m_audioClient);
     if (FAILED(hr)) {
+        qDebug() << "[WASAPI Init] Failed to activate audio client:" << QString::number(hr, 16);
         emit errorOccurred("Failed to activate audio client");
         return false;
     }
-    
-    // Get mix format
+    qDebug() << "[WASAPI Init] Audio client activated";
+
     hr = m_audioClient->GetMixFormat(&m_waveFormat);
     if (FAILED(hr)) {
-        emit errorOccurred("Failed to get mix format");
+        qDebug() << "[WASAPI Init] Failed to get mix format:" << QString::number(hr, 16);
         return false;
     }
     
-    // Initialize audio client
-    DWORD streamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-    
-    // For desktop audio (render devices), add loopback flag
+    qDebug() << "[WASAPI Init] Audio format:";
+    qDebug() << "  Sample rate:" << m_waveFormat->nSamplesPerSec << "Hz";
+    qDebug() << "  Channels:" << m_waveFormat->nChannels;
+    qDebug() << "  Bits per sample:" << m_waveFormat->wBitsPerSample;
+
+    DWORD streamFlags = 0;
     if (m_deviceType == DesktopAudio) {
         streamFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+        qDebug() << "[WASAPI Init] Using LOOPBACK mode for desktop audio";
     }
+
+    // Set buffer duration to 100ms. REFERENCE_TIME is in 100-nanosecond units,
+    // so 1000000 = 0.1 seconds. This balances latency (lower = more responsive)
+    // with buffer stability and CPU efficiency.
+    REFERENCE_TIME bufferDuration = 1000000;
+    
     
     hr = m_audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        streamFlags,
-        10000000, // 1 second buffer
-        0,
-        m_waveFormat,
+        AUDCLNT_SHAREMODE_SHARED, 
+        streamFlags, 
+        bufferDuration, 
+        0, 
+        m_waveFormat, 
         nullptr);
-    
+        
     if (FAILED(hr)) {
-        emit errorOccurred(QString("Failed to initialize audio client: 0x%1").arg(hr, 0, 16));
+        QString errorMsg = QString("Failed to initialize audio client: 0x%1").arg(hr, 0, 16);
+        if (hr == AUDCLNT_E_ALREADY_INITIALIZED) {
+            errorMsg += " (Already initialized)";
+        } else if (hr == AUDCLNT_E_DEVICE_IN_USE) {
+            errorMsg += " (Device in use)";
+        } else if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+            errorMsg += " (Unsupported format)";
+        }
+        qDebug() << "[WASAPI Init]" << errorMsg;
+        emit errorOccurred(errorMsg);
         return false;
     }
-    
-    // Get capture client
+    qDebug() << "[WASAPI Init] Audio client initialized";
+
     hr = m_audioClient->GetService(IID_IAudioCaptureClient, (void**)&m_captureClient);
     if (FAILED(hr)) {
-        emit errorOccurred("Failed to get capture client");
+        qDebug() << "[WASAPI Init] Failed to get capture client:" << QString::number(hr, 16);
         return false;
     }
-    
-    // Start audio client
+    qDebug() << "[WASAPI Init] Capture client obtained";
+
     hr = m_audioClient->Start();
     if (FAILED(hr)) {
-        emit errorOccurred("Failed to start audio client");
+        qDebug() << "[WASAPI Init] Failed to start audio client:" << QString::number(hr, 16);
         return false;
     }
-    
+    qDebug() << "[WASAPI Init] Audio client started successfully";
+
     return true;
 }
 
 void AudioCapture::cleanupWASAPI() {
+    qDebug() << "[WASAPI Cleanup] Starting cleanup...";
+    
     if (m_audioClient) {
         m_audioClient->Stop();
+        qDebug() << "[WASAPI Cleanup] Audio client stopped";
     }
     
-    if (m_captureClient) {
-        m_captureClient->Release();
-        m_captureClient = nullptr;
+    if (m_captureClient) { 
+        m_captureClient->Release(); 
+        m_captureClient = nullptr; 
+        qDebug() << "[WASAPI Cleanup] Capture client released";
     }
     
-    if (m_audioClient) {
-        m_audioClient->Release();
-        m_audioClient = nullptr;
+    if (m_audioClient) { 
+        m_audioClient->Release(); 
+        m_audioClient = nullptr; 
+        qDebug() << "[WASAPI Cleanup] Audio client released";
     }
     
-    if (m_waveFormat) {
-        CoTaskMemFree(m_waveFormat);
-        m_waveFormat = nullptr;
+    if (m_waveFormat) { 
+        CoTaskMemFree(m_waveFormat); 
+        m_waveFormat = nullptr; 
+        qDebug() << "[WASAPI Cleanup] Wave format freed";
     }
     
-    if (m_device) {
-        m_device->Release();
-        m_device = nullptr;
+    if (m_device) { 
+        m_device->Release(); 
+        m_device = nullptr; 
+        qDebug() << "[WASAPI Cleanup] Device released";
     }
     
-    if (m_deviceEnumerator) {
-        m_deviceEnumerator->Release();
-        m_deviceEnumerator = nullptr;
+    if (m_deviceEnumerator) { 
+        m_deviceEnumerator->Release(); 
+        m_deviceEnumerator = nullptr; 
+        qDebug() << "[WASAPI Cleanup] Device enumerator released";
     }
+    
+    qDebug() << "[WASAPI Cleanup] Cleanup complete";
 }
 
 void AudioCapture::captureWASAPI() {
+    qDebug() << "[WASAPI Capture] Starting capture loop...";
+    
+    // Request "Pro Audio" thread priority from Windows. This elevates our scheduling
+    // priority to minimize missed capture windows and audio glitches.
     DWORD taskIndex = 0;
     HANDLE hTask = AvSetMmThreadCharacteristics(L"Pro Audio", &taskIndex);
+    if (hTask) {
+        qDebug() << "[WASAPI Capture] Thread priority set to Pro Audio";
+    }
     
+    // Determine the audio format negotiated with the device. Some devices report
+    // IEEE float (native), others use PCM integer which we must convert manually.
+    bool isFloat = false;
+    if (m_waveFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        isFloat = true;
+    } else if (m_waveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        WAVEFORMATEXTENSIBLE* waveFormatEx = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(m_waveFormat);
+        isFloat = (waveFormatEx->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+    }
+    qDebug() << "[WASAPI Capture] Audio format:" << (isFloat ? "Float" : "PCM");
+    
+    int chunkCount = 0;
+    size_t totalSamples = 0;
+
     while (!m_stopRequested.load()) {
+        // Sleep briefly to allow other threads to run. 10ms is a reasonable balance
+        // between CPU usage and capture responsiveness.
         Sleep(10);
         
         UINT32 packetLength = 0;
         HRESULT hr = m_captureClient->GetNextPacketSize(&packetLength);
-        
         if (FAILED(hr)) {
+            qDebug() << "[WASAPI Capture] GetNextPacketSize failed:" << QString::number(hr, 16);
             break;
         }
-        
+
         while (packetLength != 0) {
             BYTE* pData;
             UINT32 numFramesAvailable;
             DWORD flags;
-            
-            hr = m_captureClient->GetBuffer(
-                &pData,
-                &numFramesAvailable,
-                &flags,
-                nullptr,
-                nullptr);
-            
+            hr = m_captureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr);
             if (FAILED(hr)) {
+                qDebug() << "[WASAPI Capture] GetBuffer failed:" << QString::number(hr, 16);
                 break;
             }
-            
-            // Convert audio data
+
+            if (numFramesAvailable == 0) {
+                m_captureClient->ReleaseBuffer(numFramesAvailable);
+                break;
+            }
+
             AudioSample sample;
             sample.channels = m_waveFormat->nChannels;
             sample.sampleRate = m_waveFormat->nSamplesPerSec;
             sample.timestamp = QDateTime::currentMSecsSinceEpoch() / 1000.0;
-            
+            size_t totalSamplesInBuffer = numFramesAvailable * sample.channels;
+
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                sample.data.resize(numFramesAvailable * sample.channels, 0.0f);
+                sample.data.resize(totalSamplesInBuffer, 0.0f);
             } else {
-                // Convert to float samples
-                if (m_waveFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ||
-                    (m_waveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-                     reinterpret_cast<WAVEFORMATEXTENSIBLE*>(m_waveFormat)->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
-                    
+                sample.data.reserve(totalSamplesInBuffer);
+                if (isFloat) {
                     float* floatData = reinterpret_cast<float*>(pData);
-                    sample.data.assign(floatData, floatData + (numFramesAvailable * sample.channels));
+                    sample.data.assign(floatData, floatData + totalSamplesInBuffer);
                 } else {
-                    // Convert from int16 to float
+                    // Convert 16-bit PCM to float in range [-1.0, 1.0]. Each sample is
+                    // divided by 32768 (2^15) to normalize to float range. This preserves
+                    // dynamic range while converting from integer to float representation.
                     int16_t* int16Data = reinterpret_cast<int16_t*>(pData);
-                    sample.data.resize(numFramesAvailable * sample.channels);
-                    
-                    for (UINT32 i = 0; i < numFramesAvailable * sample.channels; i++) {
+                    sample.data.resize(totalSamplesInBuffer);
+                    for (size_t i = 0; i < totalSamplesInBuffer; i++) {
                         sample.data[i] = int16Data[i] / 32768.0f;
                     }
                 }
             }
-            
-            // Add to buffer
+
             {
                 QMutexLocker locker(&m_bufferMutex);
                 m_buffer.push_back(sample);
                 
-                // Limit buffer size
-                while (m_buffer.size() > BUFFER_SECONDS * 2) {
+                // Maintain the buffer with time-based pruning. We keep only the most recent
+                // audio up to a maximum of 60 seconds. As new chunks arrive, old ones are
+                // discarded once the total duration exceeds this limit. This prevents
+                // unbounded memory growth while preserving instant replay data.
+                double totalDuration = 0;
+                for (const auto& s : m_buffer) {
+                    if (s.channels > 0 && s.sampleRate > 0) {
+                        totalDuration += s.data.size() / (double)(s.channels * s.sampleRate);
+                    }
+                }
+                
+                // Remove old chunks if we exceed the desired buffer time
+                const double maxBufferSeconds = 60.0;
+                while (totalDuration > maxBufferSeconds && m_buffer.size() > 1) {
+                    const auto& oldSample = m_buffer.front();
+                    if (oldSample.channels > 0 && oldSample.sampleRate > 0) {
+                        totalDuration -= oldSample.data.size() / (double)(oldSample.channels * oldSample.sampleRate);
+                    }
                     m_buffer.pop_front();
                 }
             }
             
-            m_captureClient->ReleaseBuffer(numFramesAvailable);
+            chunkCount++;
+            totalSamples += totalSamplesInBuffer;
             
-            hr = m_captureClient->GetNextPacketSize(&packetLength);
-            if (FAILED(hr)) {
-                break;
+            // Log first successful capture
+            if (chunkCount == 1) {
+                qDebug() << "[WASAPI Capture] First audio chunk captured!";
+                qDebug() << "  Samples:" << totalSamplesInBuffer;
+                qDebug() << "  Duration:" << (totalSamplesInBuffer / (double)(sample.channels * sample.sampleRate)) << "seconds";
             }
+            
+            // Periodic status
+            if (chunkCount % 100 == 0) {
+                double duration = totalSamples / (double)(m_waveFormat->nChannels * m_waveFormat->nSamplesPerSec);
+                QMutexLocker locker(&m_bufferMutex);
+                qDebug() << "[WASAPI Capture] Captured" << chunkCount << "chunks (" << duration << "seconds total," << m_buffer.size() << "in buffer)";
+            }
+
+            m_captureClient->ReleaseBuffer(numFramesAvailable);
+            hr = m_captureClient->GetNextPacketSize(&packetLength);
         }
+    }
+    
+    qDebug() << "[WASAPI Capture] Capture loop finished";
+    qDebug() << "  Total chunks captured:" << chunkCount;
+    qDebug() << "  Total samples:" << totalSamples;
+    
+    {
+        QMutexLocker locker(&m_bufferMutex);
+        qDebug() << "  Final buffer size:" << m_buffer.size() << "chunks";
     }
     
     if (hTask) {
@@ -496,7 +640,21 @@ void AudioCapture::audioInputCallback(void* userData, AudioQueueRef queue,
         QMutexLocker locker(&capture->m_bufferMutex);
         capture->m_buffer.push_back(sample);
         
-        while (capture->m_buffer.size() > BUFFER_SECONDS * 2) {
+        // Prune old buffer chunks using the same time-based strategy as WASAPI.
+        // This ensures consistent buffer behavior across platforms.
+        double totalDuration = 0;
+        for (const auto& s : capture->m_buffer) {
+            if (s.channels > 0 && s.sampleRate > 0) {
+                totalDuration += s.data.size() / (double)(s.channels * s.sampleRate);
+            }
+        }
+        
+        const double maxBufferSeconds = 60.0;
+        while (totalDuration > maxBufferSeconds && capture->m_buffer.size() > 1) {
+            const auto& oldSample = capture->m_buffer.front();
+            if (oldSample.channels > 0 && oldSample.sampleRate > 0) {
+                totalDuration -= oldSample.data.size() / (double)(oldSample.channels * oldSample.sampleRate);
+            }
             capture->m_buffer.pop_front();
         }
     }
@@ -630,7 +788,20 @@ void AudioCapture::capturePulseAudio() {
         QMutexLocker locker(&m_bufferMutex);
         m_buffer.push_back(sample);
         
-        while (m_buffer.size() > BUFFER_SECONDS * 2) {
+        // Apply the same time-based pruning logic as other platforms for consistency.
+        double totalDuration = 0;
+        for (const auto& s : m_buffer) {
+            if (s.channels > 0 && s.sampleRate > 0) {
+                totalDuration += s.data.size() / (double)(s.channels * s.sampleRate);
+            }
+        }
+        
+        const double maxBufferSeconds = 60.0;
+        while (totalDuration > maxBufferSeconds && m_buffer.size() > 1) {
+            const auto& oldSample = m_buffer.front();
+            if (oldSample.channels > 0 && oldSample.sampleRate > 0) {
+                totalDuration -= oldSample.data.size() / (double)(oldSample.channels * oldSample.sampleRate);
+            }
             m_buffer.pop_front();
         }
     }

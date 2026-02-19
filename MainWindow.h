@@ -10,11 +10,31 @@
 #include <QSpinBox>
 #include <QLineEdit>
 #include <QTimer>
+#include <QTextEdit>
 #include <memory>
 #include "ScreenRecorder.h"
 #include "AudioCapture.h"
 #include "ClipViewer.h"
 #include "VideoEncoder.h"
+
+/*
+ * MainWindow
+ *
+ * The central UI and orchestration layer. Responsibilities:
+ * - Build the primary GUI and expose controls for buffer size, hotkey,
+ *   device selection, and clip management (save/trim/upload/delete).
+ * - Own and manage subsystem instances: `ScreenRecorder`, two
+ *   `AudioCapture` instances (mic and desktop) and a `VideoEncoder`.
+ * - Coordinate lifecycle and threading: start/stop capture threads,
+ *   collect buffers and hand them off to the encoder on demand.
+ * - Surface runtime logs to an on-screen debug console to ease
+ *   troubleshooting during development.
+ *
+ * Design notes
+ * - The MainWindow keeps UI code and orchestration logic in the same
+ *   class for simplicity. Subsystems themselves encapsulate platform
+ *   details and heavy lifting (capture, encode).
+ */
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -34,12 +54,9 @@ private slots:
     
     // Audio device selection
     void onApplyAudioDevices();
-    void onMicDeviceChanged(int index);
-    void onDesktopDeviceChanged(int index);
     
     // Buffer settings
     void onBufferPresetChanged(const QString& preset);
-    void onCustomBufferChanged();
     
     // Clip management
     void onClipSelected(QListWidgetItem* item);
@@ -108,12 +125,16 @@ private:
     // Clip list and viewer
     QListWidget* m_clipsList;
     ClipViewer* m_clipViewer;
+    QTextEdit* m_logViewer;
     
     // Clip actions
     QPushButton* m_trimBtn;
     QPushButton* m_renameBtn;
     QPushButton* m_deleteBtn;
     QPushButton* m_openFolderBtn;
+    
+    // Logging
+    void addLog(const QString& message);
     
     // State
     bool m_hotkeyRegistered;

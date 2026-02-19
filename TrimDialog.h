@@ -8,6 +8,21 @@
 #include <QDialogButtonBox>
 #include <opencv2/opencv.hpp>
 
+/*
+ * TrimDialog
+ *
+ * Purpose
+ * - Presents a simple, non-destructive trimming UI for a single clip.
+ * - Uses OpenCV to seek to requested frames for preview and allows the
+ *   user to choose start/end frame indexes which the encoder will use to
+ *   write a trimmed output.
+ *
+ * Implementation notes
+ * - The dialog keeps only lightweight preview images in memory and relies
+ *   on OpenCV's on-disk decoding for random access via `CAP_PROP_POS_FRAMES`.
+ * - Frame numbers and FPS are used to display human-friendly durations.
+ */
+
 class TrimDialog : public QDialog {
     Q_OBJECT
 

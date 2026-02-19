@@ -1,3 +1,11 @@
+/*
+ * TrimDialog.cpp
+ *
+ * Provides a lightweight UI for choosing trim start/end points for a
+ * video clip. Seeking and preview use OpenCV; the dialog returns the
+ * selected frame indexes for the caller to process.
+ */
+
 #include "TrimDialog.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>

@@ -1,3 +1,11 @@
+/*
+ * ClipViewer.cpp
+ *
+ * Widget that provides simple playback controls for a saved clip. It uses
+ * OpenCV's decoding APIs to read frames and Qt to render them. The code
+ * keeps rendering on the GUI thread for simplicity.
+ */
+
 #include "ClipViewer.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>

@@ -8,15 +8,33 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Find required packages
-find_package(Qt6Core REQUIRED)
-find_package(Qt6Gui REQUIRED)
-find_package(Qt6Widgets REQUIRED)
-find_package(Qt6Multimedia REQUIRED)
-find_package(Qt6Network REQUIRED)
-find_package(Qt6Concurrent REQUIRED)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Multimedia Network)
+find_package(OpenCV REQUIRED)
+find_package(CURL REQUIRED)
 
-find_package(opencv REQUIRED)
-find_package(curl REQUIRED)
+# Find FFmpeg - handle both pkg-config and vcpkg
+if(WIN32)
+    # On Windows with vcpkg, use find_package
+    find_package(FFMPEG REQUIRED)
+    set(FFMPEG_LIBRARIES
+        ${FFMPEG_LIBAVCODEC_LIBRARIES}
+        ${FFMPEG_LIBAVFORMAT_LIBRARIES}
+        ${FFMPEG_LIBAVUTIL_LIBRARIES}
+        ${FFMPEG_LIBSWSCALE_LIBRARIES}
+        ${FFMPEG_LIBSWRESAMPLE_LIBRARIES}
+    )
+    set(FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
+else()
+    # On Unix, use pkg-config
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED
+        libavcodec
+        libavformat
+        libavutil
+        libswscale
+        libswresample
+    )
+endif()
 
 # Platform-specific settings
 if(WIN32)
@@ -74,6 +92,7 @@ set(SOURCES
     ClipViewer.cpp
     TrimDialog.cpp
     VideoEncoder.cpp
+    EncoderWorker.cpp
 )
 
 set(HEADERS
@@ -83,10 +102,7 @@ set(HEADERS
     ClipViewer.h
     TrimDialog.h
     VideoEncoder.h
-)
-set_source_files_properties(
-    TrimDialog.cpp
-    PROPERTIES SKIP_AUTOMOC OFF
+    EncoderWorker.h 
 )
 
 # Create executable
@@ -101,6 +117,7 @@ target_link_libraries(${PROJECT_NAME}
     Qt6::Network
     ${OpenCV_LIBS}
     ${CURL_LIBRARIES}
+    ${FFMPEG_LIBRARIES}
     ${PLATFORM_LIBS}
 )
 
@@ -108,6 +125,8 @@ target_link_libraries(${PROJECT_NAME}
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${OpenCV_INCLUDE_DIRS}
     ${CURL_INCLUDE_DIRS}
+    ${FFMPEG_INCLUDE_DIRS}
+    ${VCODEC_INCLUDE_DIR}
 )
 
 # Windows-specific settings

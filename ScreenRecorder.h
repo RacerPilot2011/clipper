@@ -4,6 +4,8 @@
 #include <QObject>
 #include <QThread>
 #include <QMutex>
+#include <QByteArray>
+#include <QDateTime>
 #include <QImage>
 #include <QDateTime>
 #include <deque>
@@ -23,7 +25,9 @@
 #endif
 
 struct VideoFrame {
-    QImage image;
+    QByteArray jpegData; 
+    QSize originalSize;
+    QImage::Format format;
     QDateTime timestamp;
 };
 
@@ -52,11 +56,22 @@ signals:
     void errorOccurred(const QString& error);
     void recordingStarted();
     void recordingStopped();
+    void debugLog(const QString& message);  // Send logs to UI
 
 protected:
     void run() override;
 
 private:
+    /*
+     * Frame compression helper
+     * - `compressFrame` converts a raw captured `QImage` into the on-disk
+     *   representation used by the rest of the system (compressed JPEG
+     *   stored in `VideoFrame::jpegData`) and records metadata.
+     * - Keeping compression as a separate private method centralizes the
+     *   behavior and simplifies unit testing and fallback strategies.
+     */
+    void compressFrame(const QImage& raw, VideoFrame& outFrame);
+
     int m_fps;
     int m_bufferSeconds;
     std::atomic<bool> m_recording;
@@ -69,6 +84,7 @@ private:
     ID3D11Device* m_d3dDevice;
     ID3D11DeviceContext* m_d3dContext;
     IDXGIOutputDuplication* m_deskDupl;
+    LONGLONG m_lastFramePresented;
     
     bool initD3D();
     void cleanupD3D();

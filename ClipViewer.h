@@ -8,6 +8,28 @@
 #include <QTimer>
 #include <opencv2/opencv.hpp>
 
+/*
+ * ClipViewer
+ *
+ * Purpose
+ * - A lightweight widget that provides basic playback controls for a saved
+ *   clip. It uses OpenCV's `VideoCapture` to decode frames and displays them
+ *   via Qt widgets. This component is intentionally simple: it is a viewer
+ *   (not an editor) and is optimized for responsiveness rather than feature
+ *   completeness.
+ *
+ * Responsibilities
+ * - Load a file path and probe the video for frame count and FPS.
+ * - Provide play/pause, position seeking and a textual time display.
+ * - Convert OpenCV BGR frames into Qt-friendly RGB images and scale them
+ *   for display while keeping aspect ratio.
+ *
+ * Threading and performance
+ * - All operations run on the GUI thread. Decoding is performed using
+ *   OpenCV's synchronous API; for very large files or slow codecs consider
+ *   moving decoding to a worker thread.
+ */
+
 class ClipViewer : public QWidget {
     Q_OBJECT
 
